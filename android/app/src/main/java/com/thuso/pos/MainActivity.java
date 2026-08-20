@@ -1,4 +1,4 @@
-package com.servingsync.pos;
+package com.thuso.pos;
 
 import com.getcapacitor.BridgeActivity;
 

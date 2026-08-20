@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
-    <string name="app_name">ServingSync POS</string>
-    <string name="title_activity_main">ServingSync POS</string>
-    <string name="package_name">com.servingsync.pos</string>
-    <string name="custom_url_scheme">com.servingsync.pos</string>
+    <string name="app_name">Thuso</string>
+    <string name="title_activity_main">Thuso</string>
+    <string name="package_name">com.thuso.pos</string>
+    <string name="custom_url_scheme">com.thuso.pos</string>
 </resources>
