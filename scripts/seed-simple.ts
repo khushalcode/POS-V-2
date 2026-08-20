@@ -106,9 +106,12 @@ async function seedShop(opts: {
 }
 
 async function main() {
-  console.log('Seeding simplified 2-role multi-shop data...')
+  console.log('Seeding simplified single-shop data...')
 
-  // Shop 1: Spice Garden — ORANGE bill
+  // ─── Single-shop setup ──────────────────────────────────────────────
+  // This POS is configured for ONE shop only. The shop-picker screen is
+  // skipped automatically because session.tsx auto-selects when the user
+  // has exactly one shop.
   await seedShop({
     name: 'Spice Garden',
     code: 'SPICE',
@@ -125,23 +128,6 @@ async function main() {
     ],
   })
 
-  // Shop 2: Belly Bytes — EMERALD bill
-  await seedShop({
-    name: 'Belly Bytes',
-    code: 'BELLY',
-    color: 'emerald',
-    billAccentColor: '#10b981',
-    address: '45 Brigade Road, Bengaluru',
-    phone: '+91 80400 55667',
-    gstin: '29BELLY2024G1Z2',
-    taxRate: 5,
-    admin: { name: 'Diya Reddy', email: 'admin@belly.com', password: 'admin123' },
-    staff: [
-      { name: 'Vikram Singh', email: 'vikram@belly.com', password: 'staff123' },
-      { name: 'Ananya Iyer', email: 'ananya@belly.com', password: 'staff123' },
-    ],
-  })
-
   // Super admin (access to all shops)
   await db.appUser.create({
     data: {
@@ -153,7 +139,7 @@ async function main() {
     },
   })
   console.log('Seeded Super Admin (super@servingsync.com / super123)')
-  console.log('Done. 2 roles only: admin + staff. No kitchen role.')
+  console.log('Done. Single shop. 2 roles only: admin + staff. No kitchen role.')
 }
 
 main()

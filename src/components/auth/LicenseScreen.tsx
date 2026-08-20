@@ -64,7 +64,7 @@ export function LicenseActivationScreen({ onActivated }: LicenseActivationScreen
         return
       }
       // Also store in localStorage as backup (so user can still log in even if DB gets wiped)
-      localStorage.setItem('servingsync-license', JSON.stringify({
+      localStorage.setItem('thuso-license', JSON.stringify({
         key: key.trim().toUpperCase(),
         activatedAt: result.activatedAt,
         expiresAt: result.expiresAt,
@@ -88,7 +88,7 @@ export function LicenseActivationScreen({ onActivated }: LicenseActivationScreen
           <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', delay: 0.2 }} className="w-16 h-16 rounded-2xl bg-gradient-to-br from-orange-500 to-rose-500 flex items-center justify-center shadow-2xl mx-auto mb-3">
             <ShieldCheck className="w-8 h-8 text-white" />
           </motion.div>
-          <h1 className="text-2xl font-extrabold tracking-tight text-white">ServingSync POS</h1>
+          <h1 className="text-2xl font-extrabold tracking-tight text-white">Thuso</h1>
           <p className="text-sm text-slate-400 mt-1">License Activation Required</p>
         </div>
         <Card className="p-6 shadow-2xl border-slate-700 bg-slate-800/90 backdrop-blur">
@@ -158,7 +158,7 @@ export function LicenseExpiredScreen({ expiresAt, onReactivate }: { expiresAt: s
         <p className="text-sm text-slate-400 mb-1">Your license expired on</p>
         <p className="text-sm font-semibold text-rose-400 mb-6">{new Date(expiresAt).toLocaleDateString('en-IN', { day: '2-digit', month: 'long', year: 'numeric' })}</p>
         <Card className="p-6 bg-slate-800/90 border-slate-700">
-          <p className="text-sm text-slate-300 mb-4">To continue using ServingSync POS, please enter a new license key.</p>
+          <p className="text-sm text-slate-300 mb-4">To continue using Thuso, please enter a new license key.</p>
           <Button onClick={onReactivate} className="w-full bg-gradient-to-r from-orange-500 to-rose-500 text-white"><Key className="w-4 h-4 mr-1.5" /> Enter New License Key</Button>
         </Card>
       </motion.div>
@@ -179,7 +179,7 @@ export function useLicenseCheck() {
         await initDB()
 
         // Check localStorage first (backup)
-        const localActivation = localStorage.getItem('servingsync-license')
+        const localActivation = localStorage.getItem('thuso-license')
         if (localActivation) {
           const parsed = JSON.parse(localActivation)
           const expiry = new Date(parsed.expiresAt)
@@ -188,7 +188,7 @@ export function useLicenseCheck() {
             setStatus('active'); setExpiresAt(parsed.expiresAt); setDaysLeft(remaining); return
           } else {
             setStatus('expired'); setExpiresAt(parsed.expiresAt)
-            localStorage.removeItem('servingsync-license'); return
+            localStorage.removeItem('thuso-license'); return
           }
         }
 
@@ -196,7 +196,7 @@ export function useLicenseCheck() {
         const result = licenseApi.status()
         if (result.active) {
           setStatus('active'); setExpiresAt(result.expiresAt || null); setDaysLeft(result.daysLeft || null)
-          localStorage.setItem('servingsync-license', JSON.stringify({ key: 'db', activatedAt: result.activatedAt, expiresAt: result.expiresAt }))
+          localStorage.setItem('thuso-license', JSON.stringify({ key: 'db', activatedAt: result.activatedAt, expiresAt: result.expiresAt }))
         } else if (result.reason === 'expired') {
           setStatus('expired'); setExpiresAt(result.expiresAt || null)
         } else {

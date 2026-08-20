@@ -6,7 +6,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import {
   ArrowLeft, Menu as MenuIcon, X, LayoutDashboard, UtensilsCrossed,
   Users, Truck, ShoppingCart, Wallet, TrendingUp, TrendingDown,
-  BarChart3, Settings, UserCog, Database, Bell, Bike, Activity, Store,
+  BarChart3, Settings, UserCog, Database, Bell, Bike, Activity,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -49,7 +49,6 @@ const MoneyOutPage = dynamic(() => import('./pages/MoneyOutPage'), { loading: Pa
 const ReportsPage = dynamic(() => import('./pages/ReportsPage'), { loading: PageSkeleton })
 const SettingsPage = dynamic(() => import('./pages/SettingsPage'), { loading: PageSkeleton })
 const UsersPage = dynamic(() => import('./pages/UsersPage'), { loading: PageSkeleton })
-const ShopsPage = dynamic(() => import('./pages/ShopsPage'), { loading: PageSkeleton })
 const BackupPage = dynamic(() => import('./pages/BackupPage'), { loading: PageSkeleton })
 
 interface NavItem {
@@ -94,7 +93,6 @@ const NAV_SECTIONS: NavSection[] = [
     title: 'System',
     items: [
       { id: 'users', label: 'Users', icon: UserCog, color: 'text-sky-600 bg-sky-50' },
-      { id: 'shops', label: 'Shops & Tables', icon: Store, color: 'text-orange-600 bg-orange-50' },
       { id: 'audit', label: 'Audit Log', icon: Activity, color: 'text-rose-600 bg-rose-50' },
       { id: 'settings', label: 'Settings', icon: Settings, color: 'text-slate-600 bg-slate-100' },
       { id: 'backup', label: 'Backup', icon: Database, color: 'text-fuchsia-600 bg-fuchsia-50' },
@@ -134,7 +132,7 @@ export default function ManagementMode({ onExit, currentMode, onNavigate }: Mana
 
   const renderPage = () => {
     switch (nav.currentPage) {
-      case 'dashboard': return <DashboardPage />
+      case 'dashboard': return <DashboardPage currentMode={currentMode} onNavigate={onNavigate} />
       case 'zomato': return <ZomatoPage />
       case 'menu': return <MenuPage />
       case 'customers': return <CustomersPage />
@@ -146,7 +144,6 @@ export default function ManagementMode({ onExit, currentMode, onNavigate }: Mana
       case 'reports': return <ReportsPage />
       case 'settings': return <SettingsPage />
       case 'users': return <UsersPage />
-      case 'shops': return <ShopsPage />
       case 'audit': return <AuditPage />
       case 'backup': return <BackupPage />
       default: return <DashboardPage />
@@ -160,7 +157,7 @@ export default function ManagementMode({ onExit, currentMode, onNavigate }: Mana
           <UtensilsCrossed className="w-5 h-5 text-white" />
         </div>
         <div className="flex-1 min-w-0">
-          <h1 className="text-sm font-bold tracking-tight truncate">ServingSync</h1>
+          <h1 className="text-sm font-bold tracking-tight truncate">Thuso</h1>
           <p className="text-[9px] text-slate-400 uppercase tracking-wider truncate">Management</p>
         </div>
         {isMobile && (
@@ -304,7 +301,7 @@ export default function ManagementMode({ onExit, currentMode, onNavigate }: Mana
           </div>
         </header>
 
-        <main className="flex-1 overflow-y-auto p-3 sm:p-5 lg:p-6 scroll-smooth">
+        <main className="flex-1 overflow-y-auto p-3 sm:p-5 lg:p-6 scroll-smooth thin-scrollbar">
           <AnimatePresence mode="wait">
             <motion.div
               key={nav.currentPage}

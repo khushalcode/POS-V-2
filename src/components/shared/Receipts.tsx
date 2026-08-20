@@ -28,6 +28,7 @@ export interface ReceiptStyle {
   billHeaderAlign?: string
   billExtraNote?: string | null
   billAccentColor?: string
+  billBoldFont?: boolean
   // KOT style
   kotShowLogo?: boolean
   kotShowWaiter?: boolean
@@ -38,6 +39,7 @@ export interface ReceiptStyle {
   kotHeaderAlign?: string
   kotAccentColor?: string
   kotExtraNote?: string | null
+  kotBoldFont?: boolean
 }
 
 export function KOTReceipt({ order, kotNo, style }: { order: Order; kotNo: number; style?: ReceiptStyle }) {
@@ -45,13 +47,14 @@ export function KOTReceipt({ order, kotNo, style }: { order: Order; kotNo: numbe
   const accent = style?.kotAccentColor || '#000'
   const fontSize = style?.kotFontSize || 12
   const align = style?.kotHeaderAlign || 'center'
+  const boldClass = style?.kotBoldFont ? 'bold-all' : ''
 
   return (
-    <div className="p-3 font-mono text-black" style={{ fontSize: `${fontSize}px` }}>
+    <div className={`p-3 font-mono text-black ${boldClass}`} style={{ fontSize: `${fontSize}px` }}>
       {style?.kotShowLogo !== false && (
         <div style={{ textAlign: align as any }}>
           <div className="bold lg" style={{ color: accent }}>** {style?.kotPrefix || 'KOT'} **</div>
-          <div className="bold md">{style?.shopName || 'ServingSync Restaurant'}</div>
+          <div className="bold md">{style?.shopName || 'Thuso'}</div>
           <div className="xs">Kitchen Order Ticket</div>
         </div>
       )}
@@ -152,8 +155,9 @@ export function BillReceipt({
   const accent = style?.billAccentColor || '#000'
   const fontSize = style?.billFontSize || 11
   const align = style?.billHeaderAlign || 'center'
+  const boldClass = style?.billBoldFont ? 'bold-all' : ''
 
-  const name = style?.shopName || restaurantName || 'ServingSync Restaurant'
+  const name = style?.shopName || restaurantName || 'Thuso'
   const addr = style?.address || restaurantAddr
   const phone = style?.phone || restaurantPhone
   const email = style?.email
@@ -161,7 +165,7 @@ export function BillReceipt({
   const footer = style?.footerNote || footerNote || 'Thank you for dining with us!'
 
   return (
-    <div className="p-3 font-mono text-black" style={{ fontSize: `${fontSize}px` }}>
+    <div className={`p-3 font-mono text-black ${boldClass}`} style={{ fontSize: `${fontSize}px` }}>
       {style?.billShowLogo !== false && (
         <div style={{ textAlign: align as any }}>
           <div className="bold lg" style={{ color: accent }}>{name}</div>
@@ -179,7 +183,7 @@ export function BillReceipt({
       <div className="divider" />
       <div className="row sm">
         <span>Bill No:</span>
-        <span className="bold">#{bill.billNo}</span>
+        <span className="bold">#{style?.invoicePrefix || 'INV'}-{bill.billNo}</span>
       </div>
       <div className="row sm">
         <span>Table:</span>
@@ -201,10 +205,10 @@ export function BillReceipt({
           <span>{bill.order.waiterName}</span>
         </div>
       )}
-      {style?.billShowCustomer && bill.order?.customerName && (
+      {style?.billShowCustomer && (
         <div className="row sm">
           <span>Customer:</span>
-          <span>{bill.order.customerName}</span>
+          <span>{bill.order?.customerName || 'Walk-in'}</span>
         </div>
       )}
       {style?.billShowKotNo && (
@@ -275,7 +279,7 @@ export function BillReceipt({
       )}
       <div className="center xs">
         <div>{footer}</div>
-        <div className="mt-1">Powered by ServingSync POS</div>
+        <div className="mt-1">Powered by Thuso</div>
       </div>
     </div>
   )

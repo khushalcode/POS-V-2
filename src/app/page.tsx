@@ -6,7 +6,7 @@ import {
   UtensilsCrossed, Wifi, WifiOff, ArrowRight,
   Store, LayoutDashboard, Zap, Store as StoreIcon, ChevronDown, CheckCircle2,
   Receipt, ChefHat, Bike, ShieldCheck, TrendingUp, Users, Table2, Package,
-  AlertTriangle,
+  Lock, AlertTriangle, Database,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -14,10 +14,11 @@ import { Badge } from '@/components/ui/badge'
 import { useSession } from '@/lib/session'
 import { LoginScreen } from '@/components/auth/LoginScreen'
 import { useInstallCheck } from '@/lib/use-install-check'
-import { useDbReady } from '@/lib/use-db-ready'
 import { GlobalShortcutBar } from '@/components/shared/GlobalShortcutBar'
 import { useShopFetch } from '@/hooks/use-shop-fetch'
 import { startSyncManager } from '@/lib/sync-manager'
+import { initDB } from '@/lib/client-db'
+import { bootstrapSync } from '@/lib/offline-sync'
 import CounterMode from '@/components/counter/CounterMode'
 import KitchenMode from '@/components/kitchen/KitchenMode'
 import HistoryMode from '@/components/history/HistoryMode'
@@ -32,14 +33,50 @@ const ADMIN_MODES: Mode[] = ['counter', 'direct', 'kitchen', 'history', 'zomato'
 export default function Home() {
   const { user, currentShop, loading } = useSession()
   const { status: trialStatus, daysLeft } = useInstallCheck()
-  const { ready: dbReady, error: dbError } = useDbReady()
   const [mode, setMode] = useState<Mode>('home')
+  const [dbReady, setDbReady] = useState(false)
+  const [dbError, setDbError] = useState<string | null>(null)
+
+  // ─── Initialize the SQLite WASM database BEFORE any data access ───
+  useEffect(() => {
+    let cancelled = false
+    initDB()
+      .then(() => {
+        if (cancelled) return
+        setDbReady(true)
+        // ─── Bootstrap pull from Supabase ───
+        // Pulls all remote changes since the last sync into local SQLite
+        // and drains any locally-pending writes back to Supabase. Runs in
+        // the background — the UI is already interactive at this point.
+        bootstrapSync()
+          .then(({ pulled, pushed }) => {
+            if (pulled > 0 || pushed > 0) {
+              console.log(`[bootstrap] pulled ${pulled} rows, pushed ${pushed} rows from/to Supabase`)
+            }
+            // Notify any open dashboards to refresh their data.
+            if (typeof window !== 'undefined') {
+              window.dispatchEvent(new CustomEvent('supabase-sync-complete'))
+            }
+          })
+          .catch((e) => console.warn('[bootstrap] sync failed (non-fatal):', e))
+      })
+      .catch((e) => {
+        console.error('[page.tsx] DB init failed:', e)
+        if (!cancelled) setDbError(e?.message || String(e))
+      })
+    return () => { cancelled = true }
+  }, [])
 
   // ─── Start sync manager (drains outbox to Supabase when online) ───
-  // Only start after DB is ready, since syncQueue reads from SQLite.
   useEffect(() => {
     if (!dbReady) return
     startSyncManager()
+  }, [dbReady])
+
+  useEffect(() => {
+    if (dbReady && typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('supabase-sync-complete'))
+    }
   }, [dbReady])
 
   useEffect(() => {
@@ -66,30 +103,22 @@ export default function Home() {
     if (typeof window !== 'undefined') localStorage.removeItem('posMode')
   }
 
-  // ─── Gate 1: trial / device-lock check (runs in parallel with DB init) ───
-  if (trialStatus === 'loading') {
+  if (dbError) {
+    return <DbErrorScreen message={dbError} />
+  }
+  if (!dbReady || trialStatus === 'loading') {
     return (
       <div className="min-h-screen flex items-center justify-center img-bg">
         <div className="w-12 h-12 rounded-xl bg-brand-gradient animate-pulse" />
       </div>
     )
   }
-  // Device lock removed — app works on any device
-
-  // ─── Gate 2: SQLite (sql.js WASM) initialization ───
-  // This MUST happen before LoginScreen or any data operation, otherwise
-  // getDB() throws "Database not initialized. Call initDB() first."
-  if (!dbReady) {
-    if (dbError) return <DbInitErrorScreen message={dbError} />
-    return (
-      <div className="min-h-screen flex flex-col items-center justify-center img-bg gap-4">
-        <div className="w-12 h-12 rounded-xl bg-brand-gradient animate-pulse" />
-        <p className="text-sm text-slate-300">Initializing local database…</p>
-      </div>
-    )
+  if (trialStatus === 'device_locked') {
+    return <DeviceLockedScreen />
   }
-
-  // ─── Gate 3: session check ───
+  if (trialStatus === 'expired') {
+    return <TrialExpiredScreen daysLeft={0} />
+  }
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center img-bg">
@@ -111,33 +140,6 @@ export default function Home() {
   }
 
   return <HomeScreen mode={mode} onSelect={enterMode} daysLeft={daysLeft} />
-}
-
-// ─── Database initialization error screen ───
-function DbInitErrorScreen({ message }: { message: string }) {
-  return (
-    <div className="min-h-screen img-bg flex items-center justify-center p-4">
-      <motion.div initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} className="w-full max-w-md text-center">
-        <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', delay: 0.2 }} className="w-16 h-16 rounded-2xl bg-rose-500/20 flex items-center justify-center mx-auto mb-4">
-          <AlertTriangle className="w-8 h-8 text-rose-400" />
-        </motion.div>
-        <h1 className="text-2xl font-bold text-white mb-2">Database Error</h1>
-        <p className="text-sm text-slate-400 mb-6">Could not initialize the local database. The app cannot run without it.</p>
-        <Card className="p-6 bg-slate-800/90 border-slate-700 text-left">
-          <p className="text-xs text-slate-400 mb-2 uppercase tracking-wide">Error details</p>
-          <pre className="text-xs text-rose-300 bg-slate-950/60 rounded-lg p-3 overflow-auto max-h-32 whitespace-pre-wrap break-words">{message}</pre>
-          <div className="mt-4 text-xs text-slate-300 space-y-1">
-            <p className="font-semibold text-slate-200">Possible fixes:</p>
-            <p>• Restart the app</p>
-            <p>• Check that <code className="text-orange-300">sql-wasm.wasm</code> is present in the <code className="text-orange-300">public/</code> folder</p>
-            <p>• Disable any browser extensions that block WebAssembly</p>
-            <p>• Ensure your browser supports WebAssembly (all modern browsers do)</p>
-          </div>
-          <Button onClick={() => window.location.reload()} className="w-full mt-4 bg-gradient-to-r from-orange-500 to-rose-500 text-white">Reload App</Button>
-        </Card>
-      </motion.div>
-    </div>
-  )
 }
 
 const CARD_COLORS: Record<string, { gradient: string; glow: string }> = {
@@ -188,6 +190,9 @@ function HomeScreen({ mode, onSelect, daysLeft }: { mode: Mode; onSelect: (m: Mo
 
   const visibleModes = allModes.filter((m) => m.roles.includes(user?.role as any))
 
+  const greeting = getGreeting()
+  const todayLabel = new Date().toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long' })
+
   return (
     <div className="min-h-screen img-bg">
       {/* Header */}
@@ -198,7 +203,7 @@ function HomeScreen({ mode, onSelect, daysLeft }: { mode: Mode; onSelect: (m: Mo
               <UtensilsCrossed className="w-5 h-5 text-white" />
             </div>
             <div>
-              <h1 className="text-sm font-bold text-white">ServingSync POS</h1>
+              <h1 className="text-sm font-bold text-white">Thuso</h1>
               <p className="text-[10px] text-slate-400">{user?.name} · {currentShop?.name}</p>
             </div>
           </div>
@@ -236,14 +241,42 @@ function HomeScreen({ mode, onSelect, daysLeft }: { mode: Mode; onSelect: (m: Mo
         </div>
       </header>
 
-      {/* Global shortcut bar */}
+      {/* Global shortcut bar — unchanged: Home · Direct · Counter · Zomato · Kitchen · Bills, present on every page */}
       <GlobalShortcutBar currentMode={mode} onNavigate={onSelect} />
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
+        {/* Hero / greeting row */}
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.3 }}
+          className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 mb-6 pb-5 border-b border-white/10"
+        >
+          <div>
+            <p className="text-xs sm:text-sm text-slate-300 font-medium">{greeting}, {user?.name?.split(' ')[0] || 'there'} 👋</p>
+            <h2 className="text-2xl sm:text-3xl font-extrabold text-white drop-shadow mt-0.5">{currentShop?.name}</h2>
+            <p className="text-[11px] sm:text-xs text-slate-400 mt-1">{todayLabel}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-full ring-1 ${online ? 'bg-emerald-500/15 text-emerald-300 ring-emerald-500/30' : 'bg-rose-500/15 text-rose-300 ring-rose-500/30'}`}>
+              {online ? <Wifi className="w-3.5 h-3.5" /> : <WifiOff className="w-3.5 h-3.5" />}
+              {online ? 'Online' : 'Offline'}
+            </div>
+            {daysLeft !== null && (
+              <div className={`flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-full ring-1 ${daysLeft < 30 ? 'bg-rose-500/15 text-rose-300 ring-rose-500/30' : 'bg-slate-500/15 text-slate-300 ring-slate-500/30'}`}>
+                <ShieldCheck className="w-3.5 h-3.5" /> {daysLeft}d left
+              </div>
+            )}
+          </div>
+        </motion.div>
+
         {/* Dashboard stats — shown to ALL users */}
-        <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }}>
-          <h2 className="text-xl font-bold text-white mb-3 drop-shadow">Dashboard · {currentShop?.name}</h2>
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+        <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, delay: 0.05 }} className="mb-8">
+          <div className="flex items-center gap-2 mb-3">
+            <TrendingUp className="w-4 h-4 text-slate-300" />
+            <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wide">Today at a glance</h3>
+          </div>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <DashStat label="Today's Revenue" value={formatCurrency(dashData?.today?.revenue || 0)} sub={`${dashData?.today?.count || 0} bills`} icon={TrendingUp} gradient="from-emerald-500 to-teal-600" />
             <DashStat label="Monthly Revenue" value={formatCurrency(dashData?.month?.revenue || 0)} sub={`${dashData?.month?.count || 0} bills`} icon={Receipt} gradient="from-blue-500 to-indigo-600" />
             <DashStat label="Tables Occupied" value={`${dashData?.tables?.occupied || 0} / ${dashData?.tables?.total || 0}`} sub="Live tables" icon={Table2} gradient="from-orange-500 to-rose-600" />
@@ -251,29 +284,54 @@ function HomeScreen({ mode, onSelect, daysLeft }: { mode: Mode; onSelect: (m: Mo
           </div>
         </motion.div>
 
-        {/* Mode cards */}
+        {/* Quick launch */}
+        <div className="flex items-center gap-2 mb-3">
+          <Zap className="w-4 h-4 text-slate-300" />
+          <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wide">Quick launch</h3>
+        </div>
         <section className="grid gap-3 sm:gap-4 md:grid-cols-3 mb-6">
           {visibleModes.map((m, i) => {
             const colors = CARD_COLORS[m.key] || CARD_COLORS.counter
             return (
-              <motion.div key={m.key} initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} whileHover={{ y: -4 }} transition={{ duration: 0.3, delay: 0.04 + i * 0.04 }} className={m.span}>
-                <Card onClick={() => onSelect(m.key)} className={`group cursor-pointer relative overflow-hidden border-0 shadow-lg ${colors.glow} hover:shadow-xl transition-shadow ${m.featured ? 'ring-2 ring-amber-400/60 ring-offset-2 ring-offset-slate-900' : ''} ${m.span ? 'min-h-[130px]' : 'min-h-[130px]'}`}>
-                  <div className={`absolute inset-0 bg-gradient-to-br ${colors.gradient} pointer-events-none`} />
-                  <div className="absolute inset-0 opacity-15 pointer-events-none" style={{ backgroundImage: 'radial-gradient(circle at 20% 30%, white 1px, transparent 1px)', backgroundSize: '30px 30px' }} />
-                  <div className="absolute -top-8 -right-8 w-28 h-28 rounded-full bg-white/10 blur-2xl pointer-events-none" />
-                  {m.featured && <div className="absolute top-2 right-2 z-10"><Badge className="bg-white text-orange-700 border-0 text-[9px] font-bold uppercase">⚡ Fast</Badge></div>}
-                  {m.key === 'zomato' && <div className="absolute top-2 right-2 z-10"><Badge className="bg-white text-rose-700 border-0 text-[9px] font-bold uppercase">Zomato</Badge></div>}
-                  <div className={`relative p-4 text-white h-full flex flex-col ${m.span ? 'md:flex-row md:items-center md:gap-4' : ''}`}>
-                    <div className={`w-11 h-11 rounded-xl bg-white/25 backdrop-blur-sm flex items-center justify-center ring-1 ring-white/30 mb-2.5 ${m.span ? 'md:shrink-0 md:mb-0' : ''}`}>
-                      <m.icon className="w-5 h-5" strokeWidth={2.2} />
+              <motion.div
+                key={m.key}
+                initial={{ opacity: 0, y: 16 }}
+                animate={{ opacity: 1, y: 0 }}
+                whileHover={{ y: -4 }}
+                transition={{ duration: 0.3, delay: 0.04 + i * 0.04 }}
+                className={m.span}
+              >
+                <Card
+                  onClick={() => onSelect(m.key)}
+                  className={`group cursor-pointer relative overflow-hidden border transition-all h-full ${
+                    m.span ? 'border-white/10 bg-slate-800/60' : 'border-white/10 bg-white/[0.06]'
+                  } backdrop-blur-xl hover:bg-white/[0.09] hover:border-white/25 hover:shadow-xl hover:shadow-black/20 ${
+                    m.featured ? 'ring-2 ring-amber-400/50 ring-offset-2 ring-offset-slate-900' : ''
+                  }`}
+                >
+                  {/* subtle corner glow, no more full-bleed gradient background */}
+                  <div className={`absolute -top-10 -right-10 w-32 h-32 rounded-full bg-gradient-to-br ${colors.gradient} opacity-25 blur-3xl pointer-events-none group-hover:opacity-40 transition-opacity`} />
+
+                  {m.featured && <div className="absolute top-3 right-3 z-10"><Badge className="bg-amber-400 text-amber-950 border-0 text-[9px] font-bold uppercase">⚡ Fast</Badge></div>}
+                  {m.key === 'zomato' && <div className="absolute top-3 right-3 z-10"><Badge className="bg-rose-500 text-white border-0 text-[9px] font-bold uppercase">Zomato</Badge></div>}
+
+                  <div className={`relative p-4 sm:p-5 min-h-[136px] flex flex-col ${m.span ? 'md:flex-row md:items-center md:gap-5' : ''}`}>
+                    <div className={`w-12 h-12 rounded-xl bg-gradient-to-br ${colors.gradient} shadow-lg ${colors.glow} flex items-center justify-center ring-1 ring-white/20 mb-3 ${m.span ? 'md:shrink-0 md:mb-0' : ''}`}>
+                      <m.icon className="w-5.5 h-5.5 text-white" strokeWidth={2.2} />
                     </div>
                     <div className={m.span ? 'flex-1' : 'flex-1 flex flex-col'}>
-                      <h3 className={`font-bold mb-0.5 ${m.span ? 'text-lg sm:text-xl' : 'text-base sm:text-lg'}`}>{m.title}</h3>
-                      <p className="text-[11px] text-white/85 mb-2 line-clamp-1">{m.subtitle}</p>
-                      <div className="flex flex-wrap gap-1 mb-2">
-                        {m.tags.map((t) => <span key={t} className="text-[9px] font-semibold px-1.5 py-0.5 rounded-full bg-white/20 ring-1 ring-white/25">{t}</span>)}
+                      <h3 className={`font-bold text-white mb-0.5 ${m.span ? 'text-lg sm:text-xl' : 'text-base sm:text-lg'}`}>{m.title}</h3>
+                      <p className="text-[11px] sm:text-xs text-slate-400 mb-2.5 line-clamp-1">{m.subtitle}</p>
+                      <div className="flex flex-wrap gap-1.5 mb-2.5">
+                        {m.tags.map((t) => (
+                          <span key={t} className="text-[9px] font-semibold px-2 py-0.5 rounded-full bg-white/10 text-slate-300 ring-1 ring-white/10">
+                            {t}
+                          </span>
+                        ))}
                       </div>
-                      <div className="mt-auto flex items-center gap-1 text-xs font-bold">Launch <ArrowRight className="w-3 h-3 group-hover:translate-x-1 transition-transform" /></div>
+                      <div className="mt-auto flex items-center gap-1 text-xs font-bold text-slate-200 group-hover:text-white">
+                        Launch <ArrowRight className="w-3.5 h-3.5 group-hover:translate-x-1 transition-transform" />
+                      </div>
                     </div>
                   </div>
                 </Card>
@@ -283,12 +341,20 @@ function HomeScreen({ mode, onSelect, daysLeft }: { mode: Mode; onSelect: (m: Mo
         </section>
 
         {/* Footer */}
-        <div className="flex items-center justify-center gap-4 text-[10px] text-slate-400">
-          {daysLeft !== null && <span className="flex items-center gap-1"><ShieldCheck className="w-3 h-3" /> Trial: {daysLeft} days left</span>}
+        <div className="flex items-center justify-center gap-4 text-[10px] text-slate-400 pt-2">
         </div>
       </main>
     </div>
   )
+}
+
+function getGreeting(): string {
+  const hour = new Date().getHours()
+  if (hour < 5) return 'Working late'
+  if (hour < 12) return 'Good morning'
+  if (hour < 17) return 'Good afternoon'
+  if (hour < 21) return 'Good evening'
+  return 'Good night'
 }
 
 function DashStat({ label, value, sub, icon: Icon, gradient }: { label: string; value: string; sub: string; icon: any; gradient: string }) {
@@ -354,7 +420,7 @@ function TrialExpiredScreen({ daysLeft }: { daysLeft: number }) {
         <h1 className="text-2xl font-bold text-white mb-2">Trial Period Over</h1>
         <p className="text-sm text-slate-400 mb-6">Your 365-day trial has ended. Please reinstall the app to start a new trial.</p>
         <Card className="p-6 bg-slate-800/90 border-slate-700">
-          <p className="text-sm text-slate-300 mb-4">To continue using ServingSync POS, uninstall and reinstall the application. This will reset the 365-day trial.</p>
+          <p className="text-sm text-slate-300 mb-4">To continue using Thuso, uninstall and reinstall the application. This will reset the 365-day trial.</p>
           <Button onClick={() => window.location.reload()} className="w-full bg-gradient-to-r from-orange-500 to-rose-500 text-white">Reload App</Button>
         </Card>
       </motion.div>
@@ -362,4 +428,50 @@ function TrialExpiredScreen({ daysLeft }: { daysLeft: number }) {
   )
 }
 
-// ─── Device Locked screen removed — app works on any device ───
+// ─── Device Locked screen (shown when app is moved to a different device) ───
+function DeviceLockedScreen() {
+  return (
+    <div className="min-h-screen img-bg flex items-center justify-center p-4">
+      <motion.div initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} className="w-full max-w-md text-center">
+        <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', delay: 0.2 }} className="w-16 h-16 rounded-2xl bg-rose-500/20 flex items-center justify-center mx-auto mb-4">
+          <Lock className="w-8 h-8 text-rose-400" />
+        </motion.div>
+        <h1 className="text-2xl font-bold text-white mb-2">Device Locked</h1>
+        <p className="text-sm text-slate-400 mb-6">This copy of Thuso is locked to another device and cannot be used here.</p>
+        <Card className="p-6 bg-slate-800/90 border-slate-700">
+          <div className="flex items-start gap-3 mb-4 text-left">
+            <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+            <p className="text-sm text-slate-300">
+              For security, each installation is locked to the first device it was launched on.
+              Please contact your vendor to obtain a new copy for this device.
+            </p>
+          </div>
+          <Button onClick={() => window.location.reload()} variant="outline" className="w-full border-slate-600 text-slate-300 hover:bg-slate-700">Reload</Button>
+        </Card>
+      </motion.div>
+    </div>
+  )
+}
+
+
+// ─── DB Error screen (shown when SQLite WASM fails to load) ───
+function DbErrorScreen({ message }: { message: string }) {
+  return (
+    <div className="min-h-screen img-bg flex items-center justify-center p-4">
+      <motion.div initial={{ opacity: 0, y: 24 }} animate={{ opacity: 1, y: 0 }} className="w-full max-w-md text-center">
+        <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', delay: 0.2 }} className="w-16 h-16 rounded-2xl bg-rose-500/20 flex items-center justify-center mx-auto mb-4">
+          <Database className="w-8 h-8 text-rose-400" />
+        </motion.div>
+        <h1 className="text-2xl font-bold text-white mb-2">Database Error</h1>
+        <p className="text-sm text-slate-400 mb-6">Could not initialize the local database. Please reload the page or restart the app.</p>
+        <Card className="p-6 bg-slate-800/90 border-slate-700 text-left">
+          <div className="flex items-start gap-3 mb-4">
+            <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+            <pre className="text-xs text-slate-300 whitespace-pre-wrap break-words flex-1">{message}</pre>
+          </div>
+          <Button onClick={() => window.location.reload()} className="w-full bg-gradient-to-r from-orange-500 to-rose-500 text-white">Reload App</Button>
+        </Card>
+      </motion.div>
+    </div>
+  )
+}

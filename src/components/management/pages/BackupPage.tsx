@@ -2,7 +2,7 @@
 
 import { useState, useRef } from 'react'
 import { motion } from 'framer-motion'
-import { Database, Download, Upload, AlertTriangle, CheckCircle2, Loader2, FileJson } from 'lucide-react'
+import { Database, Download, Upload, AlertTriangle, CheckCircle2, Loader2, FileJson, FileSpreadsheet } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -11,10 +11,12 @@ import {
 } from '@/components/ui/dialog'
 import { toast } from 'sonner'
 import { useShopFetch } from '@/hooks/use-shop-fetch'
+import { downloadExcel, type Sheet } from '@/lib/excel-export'
 
 export default function BackupPage() {
   const shopFetch = useShopFetch()
   const [exporting, setExporting] = useState(false)
+  const [exportingExcel, setExportingExcel] = useState(false)
   const [importing, setImporting] = useState(false)
   const [restoreFile, setRestoreFile] = useState<any>(null)
   const [showRestoreConfirm, setShowRestoreConfirm] = useState(false)
@@ -29,7 +31,7 @@ export default function BackupPage() {
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `servingsync-backup-${new Date().toISOString().split('T')[0]}.json`
+      a.download = `thuso-backup-${new Date().toISOString().split('T')[0]}.json`
       a.click()
       URL.revokeObjectURL(url)
       toast.success('Backup exported successfully')
@@ -37,6 +39,140 @@ export default function BackupPage() {
       toast.error('Export failed')
     } finally {
       setExporting(false)
+    }
+  }
+
+  const handleExportExcel = async () => {
+    setExportingExcel(true)
+    try {
+      const res = await shopFetch('/api/backup')
+      const data = await res.json()
+      const sheets: Sheet[] = []
+      // Bills sheet
+      if (Array.isArray(data.bills) && data.bills.length > 0) {
+        sheets.push({
+          name: 'Bills',
+          columns: ['Bill No', 'Date', 'Table', 'Subtotal', 'Tax Rate', 'Tax Amount', 'Discount', 'Service', 'Total', 'Payment Mode', 'Status'],
+          rows: data.bills.map((b: any) => [
+            b.billNo, (b.paidAt || '').slice(0, 19).replace('T', ' '), b.tableNumber,
+            Number(b.subtotal) || 0, Number(b.taxRate) || 0, Number(b.taxAmount) || 0,
+            Number(b.discount) || 0, Number(b.serviceCharge) || 0, Number(b.total) || 0,
+            b.paymentMode, b.paymentStatus,
+          ]),
+        })
+      }
+      // Menu items sheet
+      if (Array.isArray(data.menuItems) && data.menuItems.length > 0) {
+        sheets.push({
+          name: 'Menu Items',
+          columns: ['Name', 'Category', 'Price', 'Cost', 'Stock', 'Unit', 'Available'],
+          rows: data.menuItems.map((m: any) => [
+            m.name, m.category, Number(m.price) || 0, Number(m.cost) || 0,
+            Number(m.stock) || 0, m.unit, m.available ? 'Yes' : 'No',
+          ]),
+        })
+      }
+      // Customers sheet
+      if (Array.isArray(data.customers) && data.customers.length > 0) {
+        sheets.push({
+          name: 'Customers',
+          columns: ['Name', 'Phone', 'Email', 'Address', 'Notes', 'Created At'],
+          rows: data.customers.map((c: any) => [
+            c.name, c.phone || '', c.email || '', c.address || '', c.notes || '',
+            (c.createdAt || '').slice(0, 19).replace('T', ' '),
+          ]),
+        })
+      }
+      // Suppliers sheet
+      if (Array.isArray(data.suppliers) && data.suppliers.length > 0) {
+        sheets.push({
+          name: 'Suppliers',
+          columns: ['Name', 'Phone', 'Email', 'Address', 'Notes', 'Created At'],
+          rows: data.suppliers.map((s: any) => [
+            s.name, s.phone || '', s.email || '', s.address || '', s.notes || '',
+            (s.createdAt || '').slice(0, 19).replace('T', ' '),
+          ]),
+        })
+      }
+      // Purchases sheet
+      if (Array.isArray(data.purchases) && data.purchases.length > 0) {
+        sheets.push({
+          name: 'Purchases',
+          columns: ['Invoice #', 'Supplier', 'Subtotal', 'Tax', 'Total', 'Payment', 'Date'],
+          rows: data.purchases.map((p: any) => [
+            p.invoiceNumber, p.supplierName || '',
+            Number(p.subtotal) || 0, Number(p.taxAmount) || 0, Number(p.total) || 0,
+            p.paymentMode, (p.createdAt || '').slice(0, 19).replace('T', ' '),
+          ]),
+        })
+      }
+      // Expenses sheet
+      if (Array.isArray(data.expenses) && data.expenses.length > 0) {
+        sheets.push({
+          name: 'Expenses',
+          columns: ['Category', 'Description', 'Amount', 'Payment', 'Date'],
+          rows: data.expenses.map((e: any) => [
+            e.category, e.description, Number(e.amount) || 0,
+            e.paymentMode, (e.date || '').slice(0, 19).replace('T', ' '),
+          ]),
+        })
+      }
+      // Money In sheet
+      if (Array.isArray(data.moneyIn) && data.moneyIn.length > 0) {
+        sheets.push({
+          name: 'Money In',
+          columns: ['Source', 'Description', 'Party', 'Amount', 'Payment', 'Date'],
+          rows: data.moneyIn.map((m: any) => [
+            m.source, m.description || '', m.partyName || '',
+            Number(m.amount) || 0, m.paymentMode, (m.date || '').slice(0, 19).replace('T', ' '),
+          ]),
+        })
+      }
+      // Money Out sheet
+      if (Array.isArray(data.moneyOut) && data.moneyOut.length > 0) {
+        sheets.push({
+          name: 'Money Out',
+          columns: ['Purpose', 'Description', 'Party', 'Amount', 'Payment', 'Date'],
+          rows: data.moneyOut.map((m: any) => [
+            m.purpose, m.description || '', m.partyName || '',
+            Number(m.amount) || 0, m.paymentMode, (m.date || '').slice(0, 19).replace('T', ' '),
+          ]),
+        })
+      }
+      // Orders sheet (optional — only open/sent orders)
+      if (Array.isArray(data.orders) && data.orders.length > 0) {
+        sheets.push({
+          name: 'Orders',
+          columns: ['Table', 'Status', 'Type', 'Guests', 'Waiter', 'Customer', 'Created At'],
+          rows: data.orders.map((o: any) => [
+            o.table?.number ?? '', o.status, o.type, o.guests, o.waiterName || '',
+            o.customerName || '', (o.createdAt || '').slice(0, 19).replace('T', ' '),
+          ]),
+        })
+      }
+      // Shops sheet (overview)
+      if (Array.isArray(data.shops) && data.shops.length > 0) {
+        sheets.push({
+          name: 'Shops',
+          columns: ['Name', 'Code', 'Address', 'Phone', 'GSTIN', 'Tax Rate', 'Currency', 'Active'],
+          rows: data.shops.map((s: any) => [
+            s.name, s.code, s.address || '', s.phone || '', s.gstin || '',
+            Number(s.taxRate) || 0, s.currency, s.active ? 'Yes' : 'No',
+          ]),
+        })
+      }
+      if (sheets.length === 0) {
+        toast.info('No data to export yet')
+        return
+      }
+      const dateStr = new Date().toISOString().split('T')[0]
+      downloadExcel(sheets, `thuso-export-${dateStr}`)
+      toast.success(`Excel exported with ${sheets.length} sheet${sheets.length > 1 ? 's' : ''}`)
+    } catch (e: any) {
+      console.error(e)
+      toast.error('Excel export failed: ' + (e?.message || ''))
+    } finally {
+      setExportingExcel(false)
     }
   }
 
@@ -108,14 +244,28 @@ export default function BackupPage() {
                 Exports menu, tables, orders, bills, customers, suppliers, purchases, expenses,
                 money in/out, and settings. User passwords are excluded for security.
               </p>
-              <Button
-                onClick={handleExport}
-                disabled={exporting}
-                className="w-full bg-gradient-to-r from-emerald-500 to-teal-500 text-white"
-              >
-                {exporting ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : <Download className="w-4 h-4 mr-1" />}
-                Download Backup
-              </Button>
+              <div className="grid grid-cols-2 gap-2">
+                <Button
+                  onClick={handleExport}
+                  disabled={exporting || exportingExcel}
+                  className="bg-gradient-to-r from-emerald-500 to-teal-500 text-white"
+                >
+                  {exporting ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : <FileJson className="w-4 h-4 mr-1" />}
+                  JSON
+                </Button>
+                <Button
+                  onClick={handleExportExcel}
+                  disabled={exporting || exportingExcel}
+                  variant="outline"
+                  className="border-emerald-300 text-emerald-700 hover:bg-emerald-50"
+                >
+                  {exportingExcel ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : <FileSpreadsheet className="w-4 h-4 mr-1" />}
+                  Excel
+                </Button>
+              </div>
+              <p className="text-[10px] text-slate-400 mt-2 text-center">
+                Choose JSON for full backup/restore, Excel for accounting &amp; analysis
+              </p>
             </CardContent>
           </Card>
         </motion.div>

@@ -23,7 +23,6 @@ export interface Shop {
   taxRate: number
   serviceRate?: number
   currency: string
-  active?: boolean
 }
 
 interface SessionState {
@@ -35,15 +34,13 @@ interface SessionState {
   selectShop: (shop: Shop) => void
   logout: () => void
   setTheme: (t: 'orange' | 'emerald' | 'violet') => void
-  /** Replace the shop list (e.g. after admin creates/edits/deletes a shop). Keeps currentShop valid. */
-  refreshShops: (next: Shop[]) => void
   loading: boolean
 }
 
 const SessionContext = createContext<SessionState | undefined>(undefined)
 
-const STORAGE_KEY = 'servingsync-session'
-const THEME_KEY = 'servingsync-theme'
+const STORAGE_KEY = 'thuso-session'
+const THEME_KEY = 'thuso-theme'
 
 export function SessionProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<SessionUser | null>(null)
@@ -116,31 +113,9 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(THEME_KEY, t)
   }, [])
 
-  const refreshShops = useCallback((next: Shop[]) => {
-    setShops(next)
-    // Keep currentShop pointing at a valid entry; if it was deleted, fall back to the first active shop.
-    setCurrentShop((prev) => {
-      const stillExists = prev && next.some((s) => s.id === prev.id)
-      const fallback = stillExists ? prev : next.find((s) => s.active !== false) || next[0] || null
-      // Persist
-      const raw = localStorage.getItem(STORAGE_KEY)
-      if (raw) {
-        try {
-          const data = JSON.parse(raw)
-          data.shops = next
-          data.currentShop = fallback
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
-        } catch {
-          // ignore
-        }
-      }
-      return fallback
-    })
-  }, [])
-
   return (
     <SessionContext.Provider
-      value={{ user, shops, currentShop, theme, login, selectShop, logout, setTheme, refreshShops, loading }}
+      value={{ user, shops, currentShop, theme, login, selectShop, logout, setTheme, loading }}
     >
       {children}
     </SessionContext.Provider>

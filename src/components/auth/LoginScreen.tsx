@@ -13,7 +13,6 @@ import { Card } from '@/components/ui/card'
 import { toast } from 'sonner'
 import { useSession, type SessionUser, type Shop } from '@/lib/session'
 import { auth } from '@/lib/client-data'
-import { initDB } from '@/lib/client-db'
 
 interface LoginScreenProps {
   onLoggedOut: () => void
@@ -32,11 +31,6 @@ export function LoginScreen({ onLoggedOut }: LoginScreenProps) {
     setError('')
     setLoading(true)
     try {
-      // Defensive: ensure the SQLite WASM DB is ready before we touch it.
-      // page.tsx is supposed to gate on useDbReady() before rendering us,
-      // but this guard keeps LoginScreen safe if it's ever mounted directly.
-      await initDB()
-
       // Client-side auth — checks local SQLite database
       const result = auth.login(email, password)
       if (!result) {
@@ -64,7 +58,7 @@ export function LoginScreen({ onLoggedOut }: LoginScreenProps) {
           <motion.div initial={{ scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', delay: 0.2 }} className="w-16 h-16 rounded-2xl bg-brand-gradient flex items-center justify-center shadow-2xl mx-auto mb-3">
             <UtensilsCrossed className="w-8 h-8 text-white" />
           </motion.div>
-          <h1 className="text-2xl font-extrabold tracking-tight text-white drop-shadow-lg">ServingSync POS</h1>
+          <h1 className="text-2xl font-extrabold tracking-tight text-white drop-shadow-lg">Thuso</h1>
           <p className="text-sm text-slate-300 mt-1">Multi-shop restaurant management</p>
         </div>
         <Card className="p-6 shadow-2xl border-white/10 bg-slate-900/80 backdrop-blur-xl">

@@ -2,11 +2,17 @@
 
 import { query, queryOne, execute, genId, initDB } from './client-db'
 import { isValidKey } from './license-keys'
+import { trackUpsert, trackDelete } from './offline-sync'
 
 /**
  * Client-side data access layer
  * Replaces ALL server-side API routes with direct SQLite queries.
  * No server needed — works in APK, EXE, and browser.
+ *
+ * Every mutating call (create/update/delete) calls trackUpsert /
+ * trackDelete from offline-sync.ts so the change is queued in
+ * SyncOutbox and pushed to Supabase when online. This makes the app
+ * offline-first: data is never lost even if the device drops offline.
  */
 
 // ═══════════════════════════════════════
@@ -149,7 +155,9 @@ export const menu = {
     execute(`INSERT INTO MenuItem (id, shopId, name, category, price, cost, stock, unit, image, available)
       VALUES (?,?,?,?,?,?,?,?,?,?)`, [id, shopId, data.name, data.category || 'General', Number(data.price),
       Number(data.cost || 0), Number(data.stock || 0), data.unit || 'Pcs', data.image || null, data.available !== false ? 1 : 0])
-    return this.getById(id)
+    const created = this.getById(id)
+    if (created) trackUpsert('MenuItem', created)
+    return created
   },
   update(id: string, data: any) {
     const sets: string[] = []
@@ -165,91 +173,94 @@ export const menu = {
     if (sets.length === 0) return null
     params.push(id)
     execute(`UPDATE MenuItem SET ${sets.join(', ')} WHERE id = ?`, params)
-    return this.getById(id)
+    const updated = this.getById(id)
+    if (updated) trackUpsert('MenuItem', updated)
+    return updated
   },
   getById(id: string) { return convertMenuItem(queryOne('SELECT * FROM MenuItem WHERE id = ?', [id])) },
-  delete(id: string) { execute('DELETE FROM MenuItem WHERE id = ?', [id]) },
+  delete(id: string) { execute('DELETE FROM MenuItem WHERE id = ?', [id]); trackDelete('MenuItem', id) },
 }
 
 // ═══════════════════════════════════════
-//  SHOPS
+//  MENU CATEGORIES (per-shop, user-manageable)
 // ═══════════════════════════════════════
-export const shops = {
-  list() {
-    return query('SELECT * FROM Shop ORDER BY name').map(convertShop)
+const DEFAULT_CATEGORIES = [
+  { name: 'Starters',     color: 'amber',   sortOrder: 0 },
+  { name: 'Main Course',  color: 'rose',    sortOrder: 1 },
+  { name: 'Breads',       color: 'orange',  sortOrder: 2 },
+  { name: 'Beverages',    color: 'sky',     sortOrder: 3 },
+  { name: 'Desserts',     color: 'violet',  sortOrder: 4 },
+  { name: 'General',      color: 'slate',   sortOrder: 5 },
+]
+
+export const menuCategories = {
+  list(shopId: string) {
+    // Auto-seed defaults if the shop has no categories yet
+    let cats = query<any>('SELECT * FROM MenuCategory WHERE shopId = ? ORDER BY sortOrder ASC, name ASC', [shopId])
+    if (cats.length === 0) {
+      for (const c of DEFAULT_CATEGORIES) {
+        execute(
+          'INSERT INTO MenuCategory (id, shopId, name, color, sortOrder) VALUES (?,?,?,?,?)',
+          [genId(), shopId, c.name, c.color, c.sortOrder]
+        )
+      }
+      cats = query<any>('SELECT * FROM MenuCategory WHERE shopId = ? ORDER BY sortOrder ASC, name ASC', [shopId])
+    }
+    return cats
   },
-  listActive() {
-    return query('SELECT * FROM Shop WHERE active = 1 ORDER BY name').map(convertShop)
-  },
-  getById(id: string) {
-    return convertShop(queryOne<any>('SELECT * FROM Shop WHERE id = ?', [id]))
-  },
-  create(data: any) {
+  create(shopId: string, data: any) {
+    const name = (data?.name || '').toString().trim()
+    if (!name) throw new Error('Category name is required')
+    const existing = queryOne<any>('SELECT id FROM MenuCategory WHERE shopId = ? AND name = ?', [shopId, name])
+    if (existing) throw new Error('Category already exists')
+    const sortOrder = typeof data.sortOrder === 'number'
+      ? data.sortOrder
+      : (queryOne<any>('SELECT COUNT(*) as c FROM MenuCategory WHERE shopId = ?', [shopId])?.c || 0)
     const id = genId()
-    // Verify code is unique
-    const existing = queryOne<any>('SELECT id FROM Shop WHERE code = ?', [String(data.code || '').trim().toUpperCase()])
-    if (existing) throw new Error(`Shop code "${data.code}" already exists`)
     execute(
-      `INSERT INTO Shop (id, name, code, address, phone, gstin, taxRate, serviceRate, currency, color, active)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-      [
-        id,
-        String(data.name || '').trim(),
-        String(data.code || '').trim().toUpperCase(),
-        data.address || null,
-        data.phone || null,
-        data.gstin || null,
-        Number(data.taxRate ?? 5),
-        Number(data.serviceRate ?? 0),
-        data.currency || 'Rs.',
-        data.color || 'orange',
-        data.active !== false ? 1 : 0,
-      ]
+      'INSERT INTO MenuCategory (id, shopId, name, color, sortOrder) VALUES (?,?,?,?,?)',
+      [id, shopId, name, data?.color || 'slate', sortOrder]
     )
-    // Auto-create default ShopSetting row so SettingsPage works immediately
-    execute(
-      `INSERT INTO ShopSetting (id, shopId, shopName, billAccentColor, kotAccentColor)
-       VALUES (?,?,?,?,?)`,
-      [
-        genId(),
-        id,
-        String(data.name || '').trim(),
-        data.color === 'emerald' ? '#10b981' : data.color === 'violet' ? '#8b5cf6' : '#f97316',
-        data.color === 'emerald' ? '#10b981' : data.color === 'violet' ? '#8b5cf6' : '#f97316',
-      ]
-    )
-    return this.getById(id)
+    return queryOne('SELECT * FROM MenuCategory WHERE id = ?', [id])
   },
   update(id: string, data: any) {
+    const existing = queryOne<any>('SELECT * FROM MenuCategory WHERE id = ?', [id])
+    if (!existing) throw new Error('Category not found')
+    const newName = data?.name != null ? data.name.toString().trim() : null
+    const newColor = data?.color != null ? data.color.toString() : null
+    if (newName && newName !== existing.name) {
+      const dup = queryOne<any>('SELECT id FROM MenuCategory WHERE shopId = ? AND name = ? AND id != ?', [existing.shopId, newName, id])
+      if (dup) throw new Error('Another category already has that name')
+    }
     const sets: string[] = []
     const params: any[] = []
-    if (data.name != null) { sets.push('name = ?'); params.push(String(data.name).trim()) }
-    if (data.code != null) {
-      const newCode = String(data.code).trim().toUpperCase()
-      // Verify code uniqueness (excluding current shop)
-      const conflict = queryOne<any>('SELECT id FROM Shop WHERE code = ? AND id != ?', [newCode, id])
-      if (conflict) throw new Error(`Shop code "${newCode}" already exists`)
-      sets.push('code = ?'); params.push(newCode)
+    if (newName) { sets.push('name = ?'); params.push(newName) }
+    if (newColor) { sets.push('color = ?'); params.push(newColor) }
+    if (sets.length > 0) {
+      sets.push("updatedAt = datetime('now')")
+      params.push(id)
+      execute(`UPDATE MenuCategory SET ${sets.join(', ')} WHERE id = ?`, params)
     }
-    if (data.address !== undefined) { sets.push('address = ?'); params.push(data.address || null) }
-    if (data.phone !== undefined) { sets.push('phone = ?'); params.push(data.phone || null) }
-    if (data.gstin !== undefined) { sets.push('gstin = ?'); params.push(data.gstin || null) }
-    if (data.taxRate != null) { sets.push('taxRate = ?'); params.push(Number(data.taxRate)) }
-    if (data.serviceRate != null) { sets.push('serviceRate = ?'); params.push(Number(data.serviceRate)) }
-    if (data.currency != null) { sets.push('currency = ?'); params.push(data.currency) }
-    if (data.color != null) { sets.push('color = ?'); params.push(data.color) }
-    if (data.active != null) { sets.push('active = ?'); params.push(data.active ? 1 : 0) }
-    if (sets.length === 0) return this.getById(id)
-    params.push(id)
-    execute(`UPDATE Shop SET ${sets.join(', ')}, updatedAt = datetime('now') WHERE id = ?`, params)
-    return this.getById(id)
+    // Propagate rename to menu items
+    if (newName && newName !== existing.name) {
+      execute('UPDATE MenuItem SET category = ? WHERE shopId = ? AND category = ?', [newName, existing.shopId, existing.name])
+    }
+    return queryOne('SELECT * FROM MenuCategory WHERE id = ?', [id])
   },
   delete(id: string) {
-    // Prevent deleting the last remaining shop (would brick the app)
-    const count = queryOne<any>('SELECT COUNT(*) as c FROM Shop WHERE active = 1')
-    if (count?.c <= 1) throw new Error('Cannot delete the last active shop. Please create another shop first.')
-    // Hard delete — cascade rules in schema will remove related menu items, tables, orders, bills, etc.
-    execute('DELETE FROM Shop WHERE id = ?', [id])
+    const existing = queryOne<any>('SELECT * FROM MenuCategory WHERE id = ?', [id])
+    if (!existing) throw new Error('Category not found')
+    // Find or create "General" fallback
+    let general = queryOne<any>('SELECT * FROM MenuCategory WHERE shopId = ? AND name = ?', [existing.shopId, 'General'])
+    if (!general) {
+      const gid = genId()
+      execute('INSERT INTO MenuCategory (id, shopId, name, color, sortOrder) VALUES (?,?,?,?,?)',
+        [gid, existing.shopId, 'General', 'slate', 999])
+    }
+    // Reassign items to General
+    execute('UPDATE MenuItem SET category = ? WHERE shopId = ? AND category = ?', ['General', existing.shopId, existing.name])
+    execute('DELETE FROM MenuCategory WHERE id = ?', [id])
+    return { reassignedTo: 'General' }
   },
 }
 
@@ -271,58 +282,32 @@ export const tables = {
   seed(shopId: string) {
     const count = queryOne<any>('SELECT COUNT(*) as c FROM RestaurantTable WHERE shopId = ?', [shopId])
     if (count?.c > 0) return { seeded: false }
-    execute('INSERT INTO RestaurantTable (id, shopId, number, name, capacity, status) VALUES (?,?,?,?,?,?)', [genId(), shopId, 0, 'Direct Counter', 0, 'available'])
+    const seededIds: string[] = []
+    const directId = genId()
+    execute('INSERT INTO RestaurantTable (id, shopId, number, name, capacity, status) VALUES (?,?,?,?,?,?)', [directId, shopId, 0, 'Direct Counter', 0, 'available'])
+    seededIds.push(directId)
     for (let i = 1; i <= 10; i++) {
-      execute('INSERT INTO RestaurantTable (id, shopId, number, name, capacity, status) VALUES (?,?,?,?,?,?)', [genId(), shopId, i, `Table ${i}`, 4, 'available'])
+      const tid = genId()
+      execute('INSERT INTO RestaurantTable (id, shopId, number, name, capacity, status) VALUES (?,?,?,?,?,?)', [tid, shopId, i, `Table ${i}`, 4, 'available'])
+      seededIds.push(tid)
+    }
+    // Sync seeded tables to Supabase
+    for (const tid of seededIds) {
+      const t = queryOne<any>('SELECT * FROM RestaurantTable WHERE id = ?', [tid])
+      if (t) trackUpsert('RestaurantTable', convertTable(t))
     }
     return { seeded: true }
   },
-  create(shopId: string, data: any) {
-    // Validate: number must be unique per shop
-    const num = Number(data.number)
-    if (Number.isNaN(num) || num < 0) throw new Error('Table number must be a non-negative integer')
-    const existing = queryOne<any>(
-      'SELECT id FROM RestaurantTable WHERE shopId = ? AND number = ?',
-      [shopId, num]
-    )
-    if (existing) throw new Error(`Table number ${num} already exists in this shop`)
-    const id = genId()
-    execute(
-      'INSERT INTO RestaurantTable (id, shopId, number, name, capacity, status) VALUES (?,?,?,?,?,?)',
-      [id, shopId, num, data.name || (num === 0 ? 'Direct Counter' : `Table ${num}`), Number(data.capacity ?? 4), 'available']
-    )
-    return queryOne('SELECT * FROM RestaurantTable WHERE id = ?', [id])
-  },
   update(id: string, data: any) {
-    const sets: string[] = []
-    const params: any[] = []
-    if (data.number != null) {
-      const num = Number(data.number)
-      if (Number.isNaN(num) || num < 0) throw new Error('Table number must be a non-negative integer')
-      // Uniqueness check (excluding self)
-      const current = queryOne<any>('SELECT shopId FROM RestaurantTable WHERE id = ?', [id])
-      if (current) {
-        const dup = queryOne<any>('SELECT id FROM RestaurantTable WHERE shopId = ? AND number = ? AND id != ?', [current.shopId, num, id])
-        if (dup) throw new Error(`Table number ${num} already exists in this shop`)
-      }
-      sets.push('number = ?'); params.push(num)
-    }
-    if (data.name != null) { sets.push('name = ?'); params.push(data.name) }
-    if (data.capacity != null) { sets.push('capacity = ?'); params.push(Number(data.capacity)) }
-    // Status is normally managed by order flow; allow override only if explicitly set
+    const sets: string[] = []; const params: any[] = []
     if (data.status != null) { sets.push('status = ?'); params.push(data.status) }
+    if (data.currentOrderId !== undefined) { sets.push('currentOrderId = ?'); params.push(data.currentOrderId || null) }
     if (sets.length === 0) return null
     params.push(id)
-    execute(`UPDATE RestaurantTable SET ${sets.join(', ')}, updatedAt = datetime('now') WHERE id = ?`, params)
-    return queryOne('SELECT * FROM RestaurantTable WHERE id = ?', [id])
-  },
-  delete(id: string) {
-    // Block deletion if a table currently has an open order
-    const t = queryOne<any>('SELECT status, currentOrderId FROM RestaurantTable WHERE id = ?', [id])
-    if (t?.status === 'occupied' || t?.currentOrderId) {
-      throw new Error('Cannot delete a table with an active order. Close or transfer the order first.')
-    }
-    execute('DELETE FROM RestaurantTable WHERE id = ?', [id])
+    execute(`UPDATE RestaurantTable SET ${sets.join(', ')} WHERE id = ?`, params)
+    const t = queryOne<any>('SELECT * FROM RestaurantTable WHERE id = ?', [id])
+    if (t) trackUpsert('RestaurantTable', convertTable(t))
+    return t ? convertTable(t) : null
   },
 }
 
@@ -357,27 +342,47 @@ export const orders = {
     execute(`INSERT INTO Orders (id, shopId, tableId, status, type, guests, waiterName, customerName, notes)
       VALUES (?,?,?,?,?,?,?,?,?)`, [id, shopId, tableId, 'open', type, guests, waiterName || null, customerName || null, notes || null])
     execute('UPDATE RestaurantTable SET status = ?, currentOrderId = ? WHERE id = ?', ['occupied', id, tableId])
-    return this.getById(id)
+    const created = this.getById(id)
+    if (created) trackUpsert('Orders', created)
+    // The table's status changed too — sync that.
+    const t = queryOne<any>('SELECT * FROM RestaurantTable WHERE id = ?', [tableId])
+    if (t) trackUpsert('RestaurantTable', convertTable(t))
+    return created
   },
   delete(id: string) {
+    // Capture tableId before deleting so we can sync the freed table.
+    const order = this.getById(id)
     execute('DELETE FROM OrderItem WHERE orderId = ?', [id])
     execute('DELETE FROM Bill WHERE orderId = ?', [id])
     execute('DELETE FROM Orders WHERE id = ?', [id])
     execute('UPDATE RestaurantTable SET status = ?, currentOrderId = NULL WHERE currentOrderId = ?', ['available', id])
+    trackDelete('Orders', id)
+    if (order?.tableId) {
+      const t = queryOne<any>('SELECT * FROM RestaurantTable WHERE id = ?', [order.tableId])
+      if (t) trackUpsert('RestaurantTable', convertTable(t))
+    }
   },
   sendKOT(id: string) {
     execute('UPDATE Orders SET status = ?, kotPrinted = 1 WHERE id = ?', ['sent', id])
-    return this.getById(id)
+    const updated = this.getById(id)
+    if (updated) trackUpsert('Orders', updated)
+    return updated
   },
   updateStatus(id: string, status: string) {
     execute('UPDATE Orders SET status = ? WHERE id = ?', [status, id])
-    return this.getById(id)
+    const updated = this.getById(id)
+    if (updated) trackUpsert('Orders', updated)
+    return updated
   },
   freeTable(id: string) {
     const order = this.getById(id)
     if (!order) return
     execute('UPDATE Orders SET status = ? WHERE id = ?', ['billed', id])
     execute('UPDATE RestaurantTable SET status = ?, currentOrderId = NULL WHERE id = ?', ['available', order.tableId])
+    const updated = this.getById(id)
+    if (updated) trackUpsert('Orders', updated)
+    const t = queryOne<any>('SELECT * FROM RestaurantTable WHERE id = ?', [order.tableId])
+    if (t) trackUpsert('RestaurantTable', convertTable(t))
     return order.table?.number
   },
   // ─── Order Items ───
@@ -385,12 +390,17 @@ export const orders = {
     // Check if there's an existing pending item with same menu item
     const existing = queryOne<any>('SELECT * FROM OrderItem WHERE orderId = ? AND menuItemId = ? AND status = ? AND notes IS ?',
       [orderId, menuItemId, 'pending', notes || null])
+    let itemId: string
     if (existing) {
       execute('UPDATE OrderItem SET quantity = quantity + ? WHERE id = ?', [quantity, existing.id])
+      itemId = existing.id
     } else {
+      itemId = genId()
       execute('INSERT INTO OrderItem (id, orderId, menuItemId, name, price, quantity, status, notes) VALUES (?,?,?,?,?,?,?,?)',
-        [genId(), orderId, menuItemId, name, price, quantity, 'pending', notes || null])
+        [itemId, orderId, menuItemId, name, price, quantity, 'pending', notes || null])
     }
+    const item = queryOne('SELECT * FROM OrderItem WHERE id = ?', [itemId])
+    if (item) trackUpsert('OrderItem', item)
     return orders.getById(orderId)
   },
   updateItem(itemId: string, data: any) {
@@ -402,9 +412,11 @@ export const orders = {
     if (sets.length === 0) return null
     params.push(itemId)
     execute(`UPDATE OrderItem SET ${sets.join(', ')} WHERE id = ?`, params)
-    return queryOne('SELECT * FROM OrderItem WHERE id = ?', [itemId])
+    const updated = queryOne('SELECT * FROM OrderItem WHERE id = ?', [itemId])
+    if (updated) trackUpsert('OrderItem', updated)
+    return updated
   },
-  deleteItem(itemId: string) { execute('DELETE FROM OrderItem WHERE id = ?', [itemId]) },
+  deleteItem(itemId: string) { execute('DELETE FROM OrderItem WHERE id = ?', [itemId]); trackDelete('OrderItem', itemId) },
 }
 
 // ═══════════════════════════════════════
@@ -444,11 +456,170 @@ export const bills = {
   create(shopId: string, orderId: string, tableNumber: number, subtotal: number, taxRate: number, taxAmount: number, discount: number, serviceCharge: number, total: number, paymentMode: string) {
     const id = genId()
     const billNo = this.nextNo(shopId)
+    // ─── BUG FIX: Many callers (e.g. CounterMode.confirmBill) only pass
+    // { taxRate, discount, serviceCharge, paymentMode } in the POST body —
+    // they do NOT pass subtotal / taxAmount / total. The use-shop-fetch
+    // shim falls back to 0 for those missing fields, which means bills were
+    // being saved with subtotal=0, taxAmount=0, total=0.
+    //
+    // To make this bullet-proof, we ALWAYS recompute the amounts here from
+    // the live order items, then fall back to the caller-supplied values
+    // only if the recomputed subtotal is also 0 (defensive, shouldn't happen
+    // for a real order). The caller's taxRate / discount / serviceCharge are
+    // still honored.
+    const order = orders.getById(orderId)
+    const activeItems = (order?.items || []).filter((i: any) => i.status !== 'cancelled')
+    const computedSubtotal = activeItems.reduce((s, i) => s + Number(i.price) * Number(i.quantity), 0)
+    const safeSubtotal = computedSubtotal > 0 ? computedSubtotal : Number(subtotal) || 0
+    const safeTaxRate = Number(taxRate) || 0
+    const computedTaxAmount = Math.round(safeSubtotal * safeTaxRate) / 100
+    const safeTaxAmount = computedTaxAmount || Number(taxAmount) || 0
+    const safeDiscount = Number(discount) || 0
+    const safeServiceCharge = Number(serviceCharge) || 0
+    const computedTotal = Math.max(0, safeSubtotal + safeTaxAmount + safeServiceCharge - safeDiscount)
+    const safeTotal = computedTotal > 0 ? computedTotal : Number(total) || 0
     execute(`INSERT INTO Bill (id, shopId, billNo, orderId, tableNumber, subtotal, taxRate, taxAmount, discount, serviceCharge, total, paymentMode, paymentStatus, paidAt)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, shopId, billNo, orderId, tableNumber, subtotal, taxRate, taxAmount, discount, serviceCharge, total, paymentMode, 'paid', new Date().toISOString()])
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, shopId, billNo, orderId, tableNumber, safeSubtotal, safeTaxRate, safeTaxAmount, safeDiscount, safeServiceCharge, safeTotal, paymentMode, 'paid', new Date().toISOString()])
     execute('UPDATE Orders SET status = ?, billPrinted = 1 WHERE id = ?', ['paid', orderId])
     execute('UPDATE RestaurantTable SET status = ?, currentOrderId = NULL WHERE currentOrderId = ?', ['available', orderId])
-    return this.getById(id)
+    try {
+      execute(`INSERT INTO MoneyIn (id, shopId, amount, source, description, partyName, paymentMode, date)
+        VALUES (?,?,?,?,?,?,?,?)`,
+        [genId(), shopId, safeTotal, 'Sale', `Bill #${billNo} (Table ${tableNumber})`, null, paymentMode, new Date().toISOString()])
+    } catch (e) {
+      console.warn('[bills.create] MoneyIn auto-add failed:', e)
+    }
+    const created = this.getById(id)
+    // Sync the new bill, the paid order, and any auto-added MoneyIn to Supabase.
+    if (created) trackUpsert('Bill', created)
+    const paidOrder = orders.getById(orderId)
+    if (paidOrder) trackUpsert('Orders', paidOrder)
+    return created
+  },
+
+  /**
+   * Delete (void) a bill.
+   *
+   * Before removing the Bill row we capture a full snapshot into the
+   * DeletedBill table — this preserves an audit trail and lets the
+   * dashboard / reports show "Deleted Bill Amount" as its own metric
+   * and the Money Out page list every voided bill.
+   *
+   * We also:
+   *   • reverse the auto-added MoneyIn row that bills.create() inserted
+   *     (matched by description "Bill #<billNo> (Table <n>)") so the
+   *     cash flow ties out — otherwise the deleted sale would still be
+   *     counted as income
+   *   • free the table if it was still tied to this order
+   *   • track the deletion in the audit log
+   */
+  delete(id: string, opts?: { reason?: string; deletedBy?: string; deletedById?: string }) {
+    const bill = queryOne<any>('SELECT * FROM Bill WHERE id = ?', [id])
+    if (!bill) return false
+
+    const now = new Date().toISOString()
+    const deletedId = genId()
+
+    // 1) Archive a full snapshot into DeletedBill BEFORE deleting the bill.
+    execute(
+      `INSERT INTO DeletedBill
+        (id, shopId, originalBillId, billNo, orderId, tableNumber, subtotal, taxRate, taxAmount, discount, serviceCharge, total, paymentMode, paymentStatus, originalPaidAt, originalCreatedAt, reason, deletedBy, deletedById, deletedAt)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        deletedId, bill.shopId, bill.id, bill.billNo, bill.orderId, bill.tableNumber,
+        bill.subtotal || 0, bill.taxRate || 0, bill.taxAmount || 0,
+        bill.discount || 0, bill.serviceCharge || 0, bill.total || 0,
+        bill.paymentMode || 'cash', bill.paymentStatus || 'paid',
+        bill.paidAt, bill.createdAt,
+        opts?.reason || null, opts?.deletedBy || null, opts?.deletedById || null, now,
+      ]
+    )
+
+    // 2) Reverse the auto-added MoneyIn row from when the bill was created.
+    //    bills.create() inserts a MoneyIn with description `Bill #<n> (Table <n>)`
+    //    and source = 'Sale'. We match on that description so we only remove
+    //    the income that was tied to THIS bill, nothing else.
+    try {
+      execute(
+        `DELETE FROM MoneyIn
+         WHERE shopId = ? AND source = 'Sale'
+           AND description = ?
+           AND date >= ?`,
+        [bill.shopId, `Bill #${bill.billNo} (Table ${bill.tableNumber})`, bill.paidAt]
+      )
+    } catch (e) {
+      console.warn('[bills.delete] MoneyIn reversal failed (non-fatal):', e)
+    }
+
+    // 3) Free the table if it still points at this order.
+    try {
+      execute(
+        'UPDATE RestaurantTable SET status = ?, currentOrderId = NULL WHERE currentOrderId = ?',
+        ['available', bill.orderId]
+      )
+    } catch (e) {
+      console.warn('[bills.delete] table free failed (non-fatal):', e)
+    }
+
+    // 4) Delete the bill itself. OrderItem + Order cascade via FK ON DELETE CASCADE.
+    execute('DELETE FROM Bill WHERE id = ?', [id])
+
+    // 5) Audit log entry.
+    try {
+      execute(
+        `INSERT INTO AuditLog (id, shopId, userId, userName, action, details, createdAt)
+         VALUES (?,?,?,?,?,?,?)`,
+        [
+          genId(), bill.shopId, opts?.deletedById || null, opts?.deletedBy || null,
+          'bill_delete',
+          JSON.stringify({
+            billId: bill.id, billNo: bill.billNo, total: bill.total,
+            tableNumber: bill.tableNumber, paymentMode: bill.paymentMode,
+            reason: opts?.reason || null,
+          }),
+          now,
+        ]
+      )
+    } catch (e) {
+      console.warn('[bills.delete] audit log failed (non-fatal):', e)
+    }
+
+    // 6) Track sync. We push the deleted bill row to Supabase so other
+    //    devices converge, and also push the DeletedBill snapshot.
+    trackDelete('Bill', id)
+    const snap = queryOne('SELECT * FROM DeletedBill WHERE id = ?', [deletedId])
+    if (snap) trackUpsert('DeletedBill', snap)
+
+    return true
+  },
+}
+
+// ═══════════════════════════════════════
+//  DELETED BILLS (voided bills archive)
+// ═══════════════════════════════════════
+export const deletedBills = {
+  /**
+   * List all deleted bills for a shop, newest deletion first.
+   * Optionally filter by date range (matched on originalPaidAt so the
+   * bill is attributed to the day it was actually paid, not deleted).
+   */
+  list(shopId: string, filters?: { from?: string; to?: string }) {
+    let sql = 'SELECT * FROM DeletedBill WHERE shopId = ?'
+    const params: any[] = [shopId]
+    if (filters?.from) { sql += ' AND originalPaidAt >= ?'; params.push(filters.from) }
+    if (filters?.to) { sql += ' AND originalPaidAt <= ?'; params.push(filters.to) }
+    sql += ' ORDER BY deletedAt DESC'
+    return query(sql, params)
+  },
+
+  /** Aggregate totals for a shop, optionally filtered by date range. */
+  totals(shopId: string, filters?: { from?: string; to?: string }) {
+    let sql = 'SELECT COUNT(*) as count, COALESCE(SUM(total), 0) as total FROM DeletedBill WHERE shopId = ?'
+    const params: any[] = [shopId]
+    if (filters?.from) { sql += ' AND originalPaidAt >= ?'; params.push(filters.from) }
+    if (filters?.to) { sql += ' AND originalPaidAt <= ?'; params.push(filters.to) }
+    const row = queryOne<any>(sql, params)
+    return { count: row?.count || 0, total: row?.total || 0 }
   },
 }
 
@@ -479,6 +650,9 @@ export const settings = {
     if (sets.length === 0) return this.get(shopId)
     params.push(shopId)
     execute(`UPDATE ShopSetting SET ${sets.join(', ')} WHERE shopId = ?`, params)
+    // Note: ShopSetting is intentionally NOT synced to Supabase — settings
+    // are per-device (printer config, etc.) and shouldn't clobber another
+    // device's settings.
     return this.get(shopId)
   },
 }
@@ -523,74 +697,45 @@ export const dashboard = {
     const menuCount = queryOne<any>('SELECT COUNT(*) as c FROM MenuItem WHERE shopId = ?', [shopId])
     const customerCount = queryOne<any>('SELECT COUNT(*) as c FROM Customer WHERE shopId = ?', [shopId])
     const supplierCount = queryOne<any>('SELECT COUNT(*) as c FROM Supplier WHERE shopId = ?', [shopId])
-    const occupiedTables = queryOne<any>('SELECT COUNT(*) as c FROM RestaurantTable WHERE shopId = ? AND status = ?', [shopId, 'occupied'])
-    const totalTables = queryOne<any>('SELECT COUNT(*) as c FROM RestaurantTable WHERE shopId = ?', [shopId])
-
-    // ─── 7-day revenue chart (DashboardPage expects `chartData`) ───
-    const chartData: { date: string; total: number }[] = []
+    const occupiedTables = queryOne<any>('SELECT COUNT(*) as c FROM RestaurantTable WHERE shopId = ? AND status = ? AND number > 0', [shopId, 'occupied'])
+    const totalTables = queryOne<any>('SELECT COUNT(*) as c FROM RestaurantTable WHERE shopId = ? AND number > 0', [shopId])
+    const recentBills = query<any>('SELECT * FROM Bill WHERE shopId = ? ORDER BY paidAt DESC LIMIT 5', [shopId])
+    const topItems = query<any>(`
+      SELECT oi.name, SUM(oi.quantity) as qty, SUM(oi.quantity * oi.price) as revenue
+      FROM OrderItem oi
+      JOIN Orders o ON oi.orderId = o.id
+      WHERE o.shopId = ? AND o.createdAt >= ?
+      GROUP BY oi.name
+      ORDER BY qty DESC
+      LIMIT 5
+    `, [shopId, new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()])
+    const lowStock = query<any>('SELECT name, stock, unit FROM MenuItem WHERE shopId = ? AND stock < 10 AND stock >= 0 ORDER BY stock ASC LIMIT 5', [shopId])
+    const salesInRow = queryOne<any>('SELECT COALESCE(SUM(total), 0) as s FROM Bill WHERE shopId = ? AND paidAt >= ?', [shopId, today.toISOString()])
+    const otherInRow = queryOne<any>('SELECT COALESCE(SUM(amount), 0) as s FROM MoneyIn WHERE shopId = ? AND date >= ?', [shopId, today.toISOString()])
+    const expensesRow = queryOne<any>('SELECT COALESCE(SUM(amount), 0) as s FROM Expense WHERE shopId = ? AND date >= ?', [shopId, today.toISOString()])
+    const purchasesRow = queryOne<any>('SELECT COALESCE(SUM(total), 0) as s FROM Purchase WHERE shopId = ? AND createdAt >= ?', [shopId, today.toISOString()])
+    const otherOutRow = queryOne<any>('SELECT COALESCE(SUM(amount), 0) as s FROM MoneyOut WHERE shopId = ? AND date >= ?', [shopId, today.toISOString()])
+    // Deleted bills today (attributed by original paidAt, so a bill paid
+    // yesterday but deleted today still counts against yesterday). This is
+    // exposed as its own metric AND subtracted from net cash flow because
+    // a voided sale is effectively money that left the till.
+    const deletedTodayRow = queryOne<any>(
+      'SELECT COUNT(*) as c, COALESCE(SUM(total), 0) as s FROM DeletedBill WHERE shopId = ? AND originalPaidAt >= ?',
+      [shopId, today.toISOString()]
+    )
+    const salesIn = salesInRow?.s || 0
+    const otherIn = otherInRow?.s || 0
+    const expenses = expensesRow?.s || 0
+    const purchases = purchasesRow?.s || 0
+    const otherOut = otherOutRow?.s || 0
+    const deletedBillAmount = deletedTodayRow?.s || 0
+    const deletedBillCount = deletedTodayRow?.c || 0
+    const chartData: { date: string; revenue: number }[] = []
     for (let i = 6; i >= 0; i--) {
       const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - i)
       const next = new Date(d); next.setDate(next.getDate() + 1)
-      const r = queryOne<any>('SELECT COALESCE(SUM(total), 0) as s FROM Bill WHERE shopId = ? AND paidAt >= ? AND paidAt < ?',
-        [shopId, d.toISOString(), next.toISOString()])
-      chartData.push({ date: d.toISOString().slice(0, 10), total: r?.s || 0 })
-    }
-
-    // ─── Top items (last 30 days) ───
-    const topItems = query<any>(
-      `SELECT oi.name, SUM(oi.quantity * oi.price) as revenue, SUM(oi.quantity) as qty
-       FROM OrderItem oi
-       JOIN Orders o ON o.id = oi.orderId
-       WHERE o.shopId = ? AND o.status = 'paid'
-       GROUP BY oi.menuItemId, oi.name
-       ORDER BY revenue DESC LIMIT 5`,
-      [shopId]
-    ).map((r: any) => ({ name: r.name, revenue: Number(r.revenue) || 0, qty: Number(r.qty) || 0 }))
-
-    // ─── Recent bills (latest 5) ───
-    const recentBills = query<any>(
-      'SELECT id, billNo, total, paymentMode, paidAt FROM Bill WHERE shopId = ? ORDER BY paidAt DESC LIMIT 5',
-      [shopId]
-    ).map((b: any) => ({
-      id: b.id, billNo: b.billNo, total: Number(b.total) || 0,
-      paymentMode: b.paymentMode, paidAt: b.paidAt,
-    }))
-
-    // ─── Low-stock items (stock <= 5) ───
-    const lowStock = query<any>(
-      'SELECT id, name, stock, unit FROM MenuItem WHERE shopId = ? AND stock <= 5 ORDER BY stock ASC LIMIT 10',
-      [shopId]
-    ).map((m: any) => ({ id: m.id, name: m.name, stock: Number(m.stock) || 0, unit: m.unit }))
-
-    // ─── Cash flow (DashboardPage expects `cashFlow`) ───
-    const monthStartIso = monthStart.toISOString()
-    const salesIn = Number(queryOne<any>(
-      'SELECT COALESCE(SUM(total), 0) as s FROM Bill WHERE shopId = ? AND paidAt >= ?',
-      [shopId, monthStartIso]
-    )?.s || 0)
-    const otherIn = Number(queryOne<any>(
-      'SELECT COALESCE(SUM(amount), 0) as s FROM MoneyIn WHERE shopId = ? AND date >= ?',
-      [shopId, monthStartIso]
-    )?.s || 0)
-    const expenses = Number(queryOne<any>(
-      'SELECT COALESCE(SUM(amount), 0) as s FROM Expense WHERE shopId = ? AND date >= ?',
-      [shopId, monthStartIso]
-    )?.s || 0)
-    const purchases = Number(queryOne<any>(
-      'SELECT COALESCE(SUM(total), 0) as s FROM Purchase WHERE shopId = ? AND createdAt >= ?',
-      [shopId, monthStartIso]
-    )?.s || 0)
-    const otherOut = Number(queryOne<any>(
-      'SELECT COALESCE(SUM(amount), 0) as s FROM MoneyOut WHERE shopId = ? AND date >= ?',
-      [shopId, monthStartIso]
-    )?.s || 0)
-    const cashFlow = {
-      salesIn,
-      otherIn,
-      expenses,
-      purchases,
-      otherOut,
-      net: salesIn + otherIn - expenses - purchases - otherOut,
+      const row = queryOne<any>('SELECT COALESCE(SUM(total), 0) as s FROM Bill WHERE shopId = ? AND paidAt >= ? AND paidAt < ?', [shopId, d.toISOString(), next.toISOString()])
+      chartData.push({ date: d.toISOString().slice(0, 10), revenue: row?.s || 0 })
     }
 
     return {
@@ -599,11 +744,19 @@ export const dashboard = {
       allTime: { revenue: allBills?.s || 0, count: allBills?.c || 0 },
       catalog: { menuItems: menuCount?.c || 0, customers: customerCount?.c || 0, suppliers: supplierCount?.c || 0 },
       tables: { occupied: occupiedTables?.c || 0, total: totalTables?.c || 0 },
+      recentBills: recentBills || [],
+      topItems: topItems || [],
+      lowStock: lowStock || [],
+      // Exposed as its own block so the dashboard UI can render a
+      // "Deleted Bills" stat card. The amount is also rolled into the
+      // cashFlow.net calculation below as an outflow.
+      deletedBills: { amount: deletedBillAmount, count: deletedBillCount },
+      cashFlow: {
+        salesIn, otherIn, expenses, purchases, otherOut,
+        deletedBills: deletedBillAmount,
+        net: salesIn + otherIn - expenses - purchases - otherOut - deletedBillAmount,
+      },
       chartData,
-      topItems,
-      recentBills,
-      lowStock,
-      cashFlow,
     }
   },
 }
@@ -695,6 +848,385 @@ export const syncQueue = {
   },
 }
 
+
+
+// ═══════════════════════════════════════
+//  SHOPS
+// ═══════════════════════════════════════
+export const shops = {
+  list() { return query('SELECT * FROM Shop ORDER BY name').map(convertShop) },
+  listActive() { return query('SELECT * FROM Shop WHERE active = 1 ORDER BY name').map(convertShop) },
+  getById(id: string) { return convertShop(queryOne('SELECT * FROM Shop WHERE id = ?', [id])) },
+  create(data: any) {
+    const id = genId()
+    execute('INSERT INTO Shop (id, name, code, color, address, phone, gstin, taxRate, currency) VALUES (?,?,?,?,?,?,?,?,?)',
+      [id, data.name, (data.code || data.name.substring(0, 4)).toUpperCase(), data.color || 'orange', data.address || null, data.phone || null, data.gstin || null, data.taxRate || 5, data.currency || 'Rs.'])
+    const created = this.getById(id)
+    if (created) trackUpsert('Shop', created)
+    return created
+  },
+  update(id: string, data: any) {
+    const sets: string[] = []; const params: any[] = []
+    if (data.name) { sets.push('name = ?'); params.push(data.name) }
+    if (data.code) { sets.push('code = ?'); params.push(data.code) }
+    if (data.color) { sets.push('color = ?'); params.push(data.color) }
+    if (data.address !== undefined) { sets.push('address = ?'); params.push(data.address) }
+    if (data.phone !== undefined) { sets.push('phone = ?'); params.push(data.phone) }
+    if (data.gstin !== undefined) { sets.push('gstin = ?'); params.push(data.gstin) }
+    if (data.taxRate !== undefined) { sets.push('taxRate = ?'); params.push(data.taxRate) }
+    if (data.currency) { sets.push('currency = ?'); params.push(data.currency) }
+    if (data.active !== undefined) { sets.push('active = ?'); params.push(data.active ? 1 : 0) }
+    if (!sets.length) return this.getById(id)
+    params.push(id)
+    execute(`UPDATE Shop SET ${sets.join(', ')}, updatedAt = datetime('now') WHERE id = ?`, params)
+    const updated = this.getById(id)
+    if (updated) trackUpsert('Shop', updated)
+    return updated
+  },
+  delete(id: string) { execute('DELETE FROM Shop WHERE id = ?', [id]); trackDelete('Shop', id) },
+}
+
+// ═══════════════════════════════════════
+//  CUSTOMERS
+// ═══════════════════════════════════════
+export const customers = {
+  list(shopId: string) { return query('SELECT * FROM Customer WHERE shopId = ? ORDER BY createdAt DESC', [shopId]) },
+  create(shopId: string, data: any) {
+    const id = genId()
+    execute('INSERT INTO Customer (id, shopId, name, phone, email, address, notes) VALUES (?,?,?,?,?,?,?)',
+      [id, shopId, data.name, data.phone || null, data.email || null, data.address || null, data.notes || null])
+    const created = queryOne('SELECT * FROM Customer WHERE id = ?', [id])
+    if (created) trackUpsert('Customer', created)
+    return created
+  },
+  update(id: string, data: any) {
+    execute(`UPDATE Customer SET name = ?, phone = ?, email = ?, address = ?, notes = ?, updatedAt = datetime('now') WHERE id = ?`,
+      [data.name, data.phone || null, data.email || null, data.address || null, data.notes || null, id])
+    const updated = queryOne('SELECT * FROM Customer WHERE id = ?', [id])
+    if (updated) trackUpsert('Customer', updated)
+  },
+  delete(id: string) { execute('DELETE FROM Customer WHERE id = ?', [id]); trackDelete('Customer', id) },
+}
+
+// ═══════════════════════════════════════
+//  SUPPLIERS
+// ═══════════════════════════════════════
+export const suppliers = {
+  list(shopId: string) { return query('SELECT * FROM Supplier WHERE shopId = ? ORDER BY createdAt DESC', [shopId]) },
+  create(shopId: string, data: any) {
+    const id = genId()
+    execute('INSERT INTO Supplier (id, shopId, name, phone, email, address, notes) VALUES (?,?,?,?,?,?,?)',
+      [id, shopId, data.name, data.phone || null, data.email || null, data.address || null, data.notes || null])
+    const created = queryOne('SELECT * FROM Supplier WHERE id = ?', [id])
+    if (created) trackUpsert('Supplier', created)
+    return created
+  },
+  update(id: string, data: any) {
+    execute(`UPDATE Supplier SET name = ?, phone = ?, email = ?, address = ?, notes = ?, updatedAt = datetime('now') WHERE id = ?`,
+      [data.name, data.phone || null, data.email || null, data.address || null, data.notes || null, id])
+    const updated = queryOne('SELECT * FROM Supplier WHERE id = ?', [id])
+    if (updated) trackUpsert('Supplier', updated)
+  },
+  delete(id: string) { execute('DELETE FROM Supplier WHERE id = ?', [id]); trackDelete('Supplier', id) },
+}
+
+// ═══════════════════════════════════════
+//  PURCHASES (with stock bump)
+// ═══════════════════════════════════════
+export const purchases = {
+  list(shopId: string) { return query('SELECT * FROM Purchase WHERE shopId = ? ORDER BY createdAt DESC', [shopId]) },
+  create(shopId: string, data: any) {
+    const id = genId()
+    const items = JSON.stringify(data.items || [])
+    const total = data.items?.reduce((s: number, it: any) => s + (it.total || 0), 0) || data.total || 0
+    execute(`INSERT INTO Purchase (id, shopId, invoiceNumber, supplierId, supplierName, subtotal, taxAmount, total, paymentMode, notes, items)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      [id, shopId, data.invoiceNumber || `INV-${Date.now()}`, data.supplierId || null, data.supplierName || null,
+       data.subtotal || total, data.taxAmount || 0, total, data.paymentMode || 'cash', data.notes || null, items])
+    for (const it of (data.items || [])) {
+      if (it.menuItemId) {
+        execute('UPDATE MenuItem SET stock = stock + ? WHERE id = ?', [Number(it.qty) || 0, it.menuItemId])
+        const mi = menu.getById(it.menuItemId)
+        if (mi) trackUpsert('MenuItem', mi)
+      }
+    }
+    const created = queryOne('SELECT * FROM Purchase WHERE id = ?', [id])
+    if (created) trackUpsert('Purchase', created)
+    return created
+  },
+  delete(id: string) { execute('DELETE FROM Purchase WHERE id = ?', [id]); trackDelete('Purchase', id) },
+}
+
+// ═══════════════════════════════════════
+//  EXPENSES
+// ═══════════════════════════════════════
+export const expenses = {
+  list(shopId: string) { return query('SELECT * FROM Expense WHERE shopId = ? ORDER BY date DESC', [shopId]) },
+  create(shopId: string, data: any) {
+    const id = genId()
+    execute('INSERT INTO Expense (id, shopId, category, description, amount, paymentMode, date) VALUES (?,?,?,?,?,?,?)',
+      [id, shopId, data.category, data.description, data.amount, data.paymentMode || 'cash', data.date || new Date().toISOString()])
+    const created = queryOne('SELECT * FROM Expense WHERE id = ?', [id])
+    if (created) trackUpsert('Expense', created)
+    return created
+  },
+  delete(id: string) { execute('DELETE FROM Expense WHERE id = ?', [id]); trackDelete('Expense', id) },
+}
+
+// ═══════════════════════════════════════
+//  MONEY IN
+// ═══════════════════════════════════════
+export const moneyIn = {
+  list(shopId: string) { return query('SELECT * FROM MoneyIn WHERE shopId = ? ORDER BY date DESC', [shopId]) },
+  create(shopId: string, data: any) {
+    const id = genId()
+    execute('INSERT INTO MoneyIn (id, shopId, amount, source, description, partyName, paymentMode, date) VALUES (?,?,?,?,?,?,?,?)',
+      [id, shopId, data.amount, data.source || data.category || 'Investment', data.description || null, data.partyName || null, data.paymentMode || 'cash', data.date || new Date().toISOString()])
+    const created = queryOne('SELECT * FROM MoneyIn WHERE id = ?', [id])
+    if (created) trackUpsert('MoneyIn', created)
+    return created
+  },
+  delete(id: string) { execute('DELETE FROM MoneyIn WHERE id = ?', [id]); trackDelete('MoneyIn', id) },
+}
+
+// ═══════════════════════════════════════
+//  MONEY OUT
+// ═══════════════════════════════════════
+export const moneyOut = {
+  list(shopId: string) { return query('SELECT * FROM MoneyOut WHERE shopId = ? ORDER BY date DESC', [shopId]) },
+  create(shopId: string, data: any) {
+    const id = genId()
+    execute('INSERT INTO MoneyOut (id, shopId, amount, purpose, description, partyName, paymentMode, date) VALUES (?,?,?,?,?,?,?,?)',
+      [id, shopId, data.amount, data.purpose || data.category || 'Owner Draw', data.description || null, data.partyName || null, data.paymentMode || 'cash', data.date || new Date().toISOString()])
+    const created = queryOne('SELECT * FROM MoneyOut WHERE id = ?', [id])
+    if (created) trackUpsert('MoneyOut', created)
+    return created
+  },
+  delete(id: string) { execute('DELETE FROM MoneyOut WHERE id = ?', [id]); trackDelete('MoneyOut', id) },
+}
+
+// ═══════════════════════════════════════
+//  REPORTS (advanced filters + itemized bill rows)
+// ═══════════════════════════════════════
+export interface ReportFilters {
+  from?: string
+  to?: string
+  paymentMode?: string      // 'all' | 'cash' | 'upi' | 'card' | 'other'
+  tableNumber?: number      // 0 = Direct Counter, 1-10 = tables
+  billNoSearch?: string     // substring match on bill number
+  itemSearch?: string       // substring match on any item name in the bill
+  category?: string         // filter bills that contain at least one item in this category
+  waiter?: string           // filter by waiter name (from Orders.waiterName)
+  minAmount?: number        // bills with total >= this
+  maxAmount?: number        // bills with total <= this
+}
+
+export const reports = {
+  get(shopId: string, filtersOrFrom?: ReportFilters | string, maybeTo?: string) {
+    // Backward-compat: callers can still pass (shopId, from, to) directly.
+    // New callers should pass (shopId, { from, to, paymentMode, ... }).
+    const filters: ReportFilters =
+      typeof filtersOrFrom === 'string'
+        ? { from: filtersOrFrom, to: maybeTo }
+        : (filtersOrFrom || {})
+
+    const fromIso = filters.from ? new Date(filters.from).toISOString() : new Date(0).toISOString()
+    const toIso = filters.to ? new Date(filters.to).toISOString() : new Date().toISOString()
+
+    // Pull all bills in the date window, then attach their orders + items
+    // so we can filter by item/category/waiter client-side. SQLite on the
+    // client doesn't have great JOIN support via sql.js, so we do it in JS.
+    const billRows = query<any>(
+      'SELECT * FROM Bill WHERE shopId = ? AND paidAt >= ? AND paidAt <= ? ORDER BY paidAt DESC',
+      [shopId, fromIso, toIso]
+    )
+    // Attach order + items to each bill (needed for itemized table + filters)
+    const bills = billRows.map((b: any) => {
+      const order = orders.getById(b.orderId)
+      return { ...b, order }
+    })
+
+    const expensesList = query<any>('SELECT * FROM Expense WHERE shopId = ? AND date >= ? AND date <= ?', [shopId, fromIso, toIso])
+    const purchasesList = query<any>('SELECT * FROM Purchase WHERE shopId = ? AND createdAt >= ? AND createdAt <= ?', [shopId, fromIso, toIso])
+    // Deleted bills in the same window — attributed by originalPaidAt so
+    // the report for a given day/month correctly shows what was voided
+    // from that period's sales.
+    const deletedBillsList = query<any>(
+      'SELECT * FROM DeletedBill WHERE shopId = ? AND originalPaidAt >= ? AND originalPaidAt <= ? ORDER BY deletedAt DESC',
+      [shopId, fromIso, toIso]
+    )
+
+    // ─── Apply advanced filters ──────────────────────────────────────────
+    let filteredBills = bills
+    if (filters.paymentMode && filters.paymentMode !== 'all') {
+      filteredBills = filteredBills.filter((b: any) => b.paymentMode === filters.paymentMode)
+    }
+    if (filters.tableNumber != null && !Number.isNaN(filters.tableNumber)) {
+      filteredBills = filteredBills.filter((b: any) => b.tableNumber === filters.tableNumber)
+    }
+    if (filters.billNoSearch) {
+      const term = String(filters.billNoSearch).toLowerCase()
+      filteredBills = filteredBills.filter((b: any) => String(b.billNo).includes(term))
+    }
+    if (filters.itemSearch) {
+      const term = String(filters.itemSearch).toLowerCase()
+      filteredBills = filteredBills.filter((b: any) =>
+        (b.order?.items || []).some((it: any) =>
+          String(it.name || '').toLowerCase().includes(term)
+        )
+      )
+    }
+    if (filters.category && filters.category !== 'all') {
+      filteredBills = filteredBills.filter((b: any) =>
+        (b.order?.items || []).some((it: any) => {
+          // OrderItem doesn't store category directly; we look it up from
+          // the menu by menuItemId if available, else by name match.
+          const mi = queryOne<any>('SELECT category FROM MenuItem WHERE id = ?', [it.menuItemId])
+          return mi?.category === filters.category
+        })
+      )
+    }
+    if (filters.waiter) {
+      const term = String(filters.waiter).toLowerCase()
+      filteredBills = filteredBills.filter((b: any) =>
+        String(b.order?.waiterName || '').toLowerCase().includes(term)
+      )
+    }
+    if (filters.minAmount != null && !Number.isNaN(filters.minAmount)) {
+      filteredBills = filteredBills.filter((b: any) => Number(b.total) >= filters.minAmount!)
+    }
+    if (filters.maxAmount != null && !Number.isNaN(filters.maxAmount)) {
+      filteredBills = filteredBills.filter((b: any) => Number(b.total) <= filters.maxAmount!)
+    }
+
+    // ─── Build itemized rows (one row per line item across all filtered bills) ───
+    // This powers the detailed sales table and the per-item breakdown.
+    const itemizedRows: any[] = []
+    for (const b of filteredBills) {
+      const items = (b.order?.items || []).filter((it: any) => it.status !== 'cancelled')
+      for (const it of items) {
+        const mi = queryOne<any>('SELECT category FROM MenuItem WHERE id = ?', [it.menuItemId])
+        itemizedRows.push({
+          billNo: b.billNo,
+          paidAt: b.paidAt,
+          tableNumber: b.tableNumber,
+          waiterName: b.order?.waiterName || null,
+          customerName: b.order?.customerName || null,
+          paymentMode: b.paymentMode,
+          itemName: it.name,
+          category: mi?.category || 'General',
+          quantity: Number(it.quantity) || 0,
+          price: Number(it.price) || 0,
+          lineTotal: (Number(it.quantity) || 0) * (Number(it.price) || 0),
+          billTotal: Number(b.total) || 0,
+        })
+      }
+    }
+
+    // ─── Aggregates from FILTERED bills ──────────────────────────────────
+    const salesRevenue = filteredBills.reduce((s: number, b: any) => s + (b.total || 0), 0)
+    const totalExpenses = expensesList.reduce((s: number, e: any) => s + (e.amount || 0), 0)
+    const totalPurchases = purchasesList.reduce((s: number, p: any) => s + (p.total || 0), 0)
+    const deletedBillAmount = deletedBillsList.reduce((s: number, d: any) => s + (d.total || 0), 0)
+    const totalItemsSold = itemizedRows.reduce((s: number, r: any) => s + (r.quantity || 0), 0)
+
+    // Payment breakdown — count + total
+    const byPaymentMap: Record<string, { count: number; total: number }> = {}
+    for (const b of filteredBills) {
+      const m = b.paymentMode || 'other'
+      if (!byPaymentMap[m]) byPaymentMap[m] = { count: 0, total: 0 }
+      byPaymentMap[m].count++
+      byPaymentMap[m].total += (b.total || 0)
+    }
+
+    // Top items (by qty) — computed from itemizedRows.
+    // Includes category so the UI can show it in the item-wise table.
+    const topItemsMap: Record<string, { name: string; category: string; qty: number; revenue: number }> = {}
+    for (const r of itemizedRows) {
+      if (!topItemsMap[r.itemName]) topItemsMap[r.itemName] = { name: r.itemName, category: r.category, qty: 0, revenue: 0 }
+      topItemsMap[r.itemName].qty += r.quantity
+      topItemsMap[r.itemName].revenue += r.lineTotal
+    }
+    const topItems = Object.values(topItemsMap).sort((a, b) => b.qty - a.qty).slice(0, 100)
+
+    // Category breakdown
+    const categoryMap: Record<string, { qty: number; revenue: number }> = {}
+    for (const r of itemizedRows) {
+      if (!categoryMap[r.category]) categoryMap[r.category] = { qty: 0, revenue: 0 }
+      categoryMap[r.category].qty += r.quantity
+      categoryMap[r.category].revenue += r.lineTotal
+    }
+    const byCategory = Object.entries(categoryMap)
+      .map(([name, v]) => ({ name, qty: v.qty, revenue: v.revenue }))
+      .sort((a, b) => b.revenue - a.revenue)
+
+    // Expense breakdown
+    const expenseByCategory: Record<string, number> = {}
+    for (const e of expensesList) expenseByCategory[e.category] = (expenseByCategory[e.category] || 0) + (e.amount || 0)
+
+    // Daily breakdown (sales per day)
+    const dailyMap: Record<string, { sales: number; expenses: number; count: number }> = {}
+    for (const b of filteredBills) {
+      const day = (b.paidAt || '').slice(0, 10)
+      if (!day) continue
+      if (!dailyMap[day]) dailyMap[day] = { sales: 0, expenses: 0, count: 0 }
+      dailyMap[day].sales += (b.total || 0)
+      dailyMap[day].count++
+    }
+    for (const e of expensesList) {
+      const day = (e.date || '').slice(0, 10)
+      if (!day) continue
+      if (!dailyMap[day]) dailyMap[day] = { sales: 0, expenses: 0, count: 0 }
+      dailyMap[day].expenses += (e.amount || 0)
+    }
+    const dailyBreakdown = Object.entries(dailyMap)
+      .map(([date, v]) => ({ date, sales: v.sales, expenses: v.expenses, count: v.count }))
+      .sort((a, b) => a.date.localeCompare(b.date))
+
+    // Hourly breakdown (sales by hour of day) — useful for staffing decisions
+    const hourlyMap: Record<number, { sales: number; count: number }> = {}
+    for (let h = 0; h < 24; h++) hourlyMap[h] = { sales: 0, count: 0 }
+    for (const b of filteredBills) {
+      const d = new Date(b.paidAt)
+      const h = d.getHours()
+      hourlyMap[h].sales += (b.total || 0)
+      hourlyMap[h].count++
+    }
+    const hourlyBreakdown = Object.entries(hourlyMap).map(([hour, v]) => ({
+      hour: Number(hour),
+      label: `${String(hour).padStart(2, '0')}:00`,
+      sales: v.sales,
+      count: v.count,
+    }))
+
+    return {
+      summary: {
+        salesRevenue,
+        totalExpenses,
+        totalPurchases,
+        deletedBillAmount,
+        deletedBillCount: deletedBillsList.length,
+        netProfit: salesRevenue - totalExpenses - totalPurchases - deletedBillAmount,
+        cashFlow: salesRevenue - totalExpenses - totalPurchases - deletedBillAmount,
+        billCount: filteredBills.length,
+        avgBill: filteredBills.length ? salesRevenue / filteredBills.length : 0,
+        totalItemsSold,
+      },
+      byPayment: byPaymentMap,
+      byCategory,
+      topItems,
+      expenseByCategory,
+      dailyBreakdown,
+      hourlyBreakdown,
+      // bills now have .order attached so the UI can show itemized rows
+      bills: filteredBills,
+      // Flat one-row-per-line-item table — for the detailed sales report
+      itemizedRows,
+      deletedBills: deletedBillsList,
+    }
+  },
+}
+
 // ═══════════════════════════════════════
 //  CONVERTERS (SQLite integer → JS boolean/types)
 // ═══════════════════════════════════════
@@ -718,7 +1250,7 @@ function convertBill(row: any) {
 }
 function convertSettings(row: any) {
   if (!row) return null
-  const boolKeys = ['billShowLogo','billShowGstin','billShowPhone','billShowAddress','billShowEmail','billShowDateTime','billShowWaiter','billShowCustomer','billShowKotNo','kotShowLogo','kotShowWaiter','kotShowDateTime','kotShowTable','kotShowGuests','zomatoEnabled']
+  const boolKeys = ['billShowLogo','billShowGstin','billShowPhone','billShowAddress','billShowEmail','billShowDateTime','billShowWaiter','billShowCustomer','billShowKotNo','billBoldFont','kotShowLogo','kotShowWaiter','kotShowDateTime','kotShowTable','kotShowGuests','kotBoldFont','zomatoEnabled']
   const result = { ...row }
   for (const key of boolKeys) { if (key in result) result[key] = !!result[key] }
   return result

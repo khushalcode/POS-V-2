@@ -15,7 +15,6 @@ export type ManagementPage =
   | 'reports'
   | 'settings'
   | 'users'
-  | 'shops'
   | 'audit'
   | 'backup'
 

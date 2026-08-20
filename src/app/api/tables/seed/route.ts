@@ -12,7 +12,7 @@ export async function POST(req: NextRequest) {
     const tables = await db.restaurantTable.findMany({ where: { shopId }, orderBy: { number: 'asc' } })
     return NextResponse.json({ seeded: false, count: existing, tables })
   }
-  const created: ReturnType<typeof db.restaurantTable.create>[] = []
+  const created = []
   // Virtual Direct Counter table (number 0)
   created.push(
     db.restaurantTable.create({

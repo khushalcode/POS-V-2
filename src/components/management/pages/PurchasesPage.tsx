@@ -26,19 +26,24 @@ export default function PurchasesPage() {
 
   const load = useCallback(async () => {
     setLoading(true)
-    const [pRes, sRes, mRes] = await Promise.all([
-      fetch('/api/purchases'),
-      fetch('/api/suppliers'),
-      fetch('/api/menu'),
-    ])
-    const pData = await pRes.json()
-    const sData = await sRes.json()
-    const mData = await mRes.json()
-    setItems(pData.purchases)
-    setSuppliers(sData.suppliers)
-    setMenu(mData.items)
-    setLoading(false)
-  }, [])
+    try {
+      const [pRes, sRes, mRes] = await Promise.all([
+        shopFetch('/api/purchases'),
+        shopFetch('/api/suppliers'),
+        shopFetch('/api/menu'),
+      ])
+      const pData = await pRes.json()
+      const sData = await sRes.json()
+      const mData = await mRes.json()
+      setItems(pData.purchases || [])
+      setSuppliers(sData.suppliers || [])
+      setMenu(mData.items || [])
+    } catch (e) {
+      console.error('[PurchasesPage] load failed:', e)
+    } finally {
+      setLoading(false)
+    }
+  }, [shopFetch])
 
   useEffect(() => { load() }, [load])
 

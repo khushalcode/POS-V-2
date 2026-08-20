@@ -1,34 +1,22 @@
 import type { NextConfig } from "next";
 
-// The Android APK build (Capacitor) needs a static export (`output: "export"`,
-// producing ./out with an index.html). The Windows .exe / server build needs
-// `output: "standalone"` (producing .next/standalone/server.js).
-// The build-apk workflow sets BUILD_MODE=apk to select the right one.
+// ─── Build mode selection ──────────────────────────────────────────────
+// - "standalone" → for Electron .exe and Node.js server deployments
+// - "export"     → for Android APK (Capacitor) and static hosting
 //
-// NOTE: `output: "export"` does not support API Route Handlers with
-// POST/PUT/DELETE (only static GET). Since this app has ~30 such routes
-// under src/app/api, the build-apk workflow temporarily moves that folder
-// out of src/app before running `next build` in apk mode, and restores it
-// afterwards. The packaged Android/Electron app talks to a local SQLite
-// database directly (see src/hooks/use-shop-fetch.ts) rather than through
-// these API routes at runtime, so they aren't needed in that build anyway.
-const isApkBuild = process.env.BUILD_MODE === "apk";
+// Auto-detect: if BUILD_TARGET=apk is set, use export. Otherwise default
+// to standalone (the original mode, safe for both Electron and dev).
+const isApkBuild = process.env.BUILD_TARGET === "apk";
 
 const nextConfig: NextConfig = {
   output: isApkBuild ? "export" : "standalone",
-  images: {
-    unoptimized: isApkBuild,
-  },
-  /* config options here */
+  // Static export doesn't support image optimization; turn it off when
+  // building for APK so images are served as-is.
+  ...(isApkBuild ? { images: { unoptimized: true } } : {}),
   typescript: {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
-  allowedDevOrigins: [
-    "127.0.0.1", "localhost", "0.0.0.0",
-    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-    ".space-z.ai", ".vercel.app", ".ngrok.io", ".ngrok.app", ".ngrok-free.app", ".localtunnel.me",
-  ],
 };
 
 export default nextConfig;

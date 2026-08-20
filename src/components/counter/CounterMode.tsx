@@ -31,7 +31,7 @@ import { BillingDialog } from './BillingDialog'
 import { PrintPreview } from '@/components/shared/PrintPreview'
 import { KOTReceipt } from '@/components/shared/Receipts'
 import { PendingOrdersSubTab } from '@/components/shared/PendingOrdersSubTab'
-import { GlobalShortcutBar as GlobalShortcutBarInline } from '@/components/shared/GlobalShortcutBar'
+import { GlobalShortcutBar } from '@/components/shared/GlobalShortcutBar'
 import { useRestaurantSync } from '@/hooks/use-restaurant-sync'
 import { useShopFetch } from '@/hooks/use-shop-fetch'
 import { useSession } from '@/lib/session'
@@ -67,6 +67,7 @@ export default function CounterMode({ onExit, directMode, currentMode, onNavigat
   const [showBilling, setShowBilling] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [deleteReason, setDeleteReason] = useState('')
+  const [showSaveConfirm, setShowSaveConfirm] = useState(false)
   const [billNo, setBillNo] = useState(1001)
 
   // When switching from Direct → Counter via shortcut bar, reset to table grid
@@ -87,29 +88,26 @@ export default function CounterMode({ onExit, directMode, currentMode, onNavigat
   const loadTables = useCallback(async () => {
     const res = await shopFetch('/api/tables')
     const data = await res.json()
-    setTables(Array.isArray(data?.tables) ? data.tables : [])
+    setTables(data.tables)
   }, [shopFetch])
 
   const loadMenu = useCallback(async () => {
     const res = await shopFetch('/api/menu')
     const data = await res.json()
-    // Defensive: API contract is { items: MenuItem[] }, but if the route 404s or
-    // returns an error envelope, data.items will be undefined — fall back to []
-    // so render code that calls menu.filter(...) never crashes.
-    setMenu(Array.isArray(data?.items) ? data.items : [])
+    setMenu(data.items)
   }, [shopFetch])
 
   const loadBillNo = useCallback(async () => {
     const res = await shopFetch('/api/bills/next-no')
     const data = await res.json()
-    setBillNo(typeof data?.nextNo === 'number' ? data.nextNo : 1001)
+    setBillNo(data.nextNo)
   }, [shopFetch])
 
   const loadSettings = useCallback(async () => {
     try {
       const res = await shopFetch('/api/settings')
       const data = await res.json()
-      setSettings(data?.settings || null)
+      setSettings(data.settings)
     } catch {
       // settings are optional; fall back to defaults
     }
@@ -183,10 +181,40 @@ export default function CounterMode({ onExit, directMode, currentMode, onNavigat
       // Existing order — load it fully
       const res = await shopFetch(`/api/orders/${t.currentOrder.id}`)
       const data = await res.json()
-      setOrder(data.order)
-      setGuests(data.order.guests)
-      setWaiterName(data.order.waiterName || '')
-      setOrderNotes(data.order.notes || '')
+      const existingOrder = data.order
+      // ─── If the existing order is in a terminal state (paid/billed), DON'T reuse it ───
+      // Create a brand-new empty order instead, so the menu + cart reset cleanly.
+      // This fixes the bug where after "Confirm & Save" the old items reappear because
+      // the useEffect runs before loadTables() updates the tables state.
+      if (existingOrder && (existingOrder.status === 'paid' || existingOrder.status === 'billed')) {
+        try {
+          // Free the table first (defensive — should already be free)
+          await shopFetch(`/api/orders/${existingOrder.id}/free-table`, { method: 'POST' })
+        } catch (e) {
+          console.warn('[openTable] free-table failed (non-fatal):', e)
+        }
+        // Create a fresh empty order
+        try {
+          const newRes = await shopFetch('/api/orders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tableId: t.id, guests: 1, type: orderType }),
+          })
+          if (newRes.ok) {
+            const newData = await newRes.json()
+            setOrder(newData.order)
+            await loadTables()
+            sync.sendTableOccupied({ tableId: t.id, tableNumber: t.number, orderId: newData.order.id })
+            return
+          }
+        } catch (e) {
+          console.warn('[openTable] new order creation failed:', e)
+        }
+      }
+      setOrder(existingOrder)
+      setGuests(existingOrder?.guests || 1)
+      setWaiterName(existingOrder?.waiterName || '')
+      setOrderNotes(existingOrder?.notes || '')
     } else {
       // Create new open order
       try {
@@ -217,12 +245,50 @@ export default function CounterMode({ onExit, directMode, currentMode, onNavigat
     setPrintedItemIds(new Set())
     setKotItemsToPrint([])
     setKotNo(0)
+    setShowSaveConfirm(false)
+    setShowBilling(false)
     loadTables()
   }
+
+  // ─── In direct mode, immediately start a NEW direct order after closing ───
+  // The user must NEVER see the table grid in direct mode — always show menu.
+  useEffect(() => {
+    if (!directMode || loading || tables.length === 0) return
+    if (selectedTable) return
+    const directTable = tables.find((t) => t.number === 0)
+    if (directTable) {
+      openTable({ ...directTable, type: 'direct' } as any)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [directMode, loading, tables.length, selectedTable])
 
   // ----- Item actions -----
   const addItem = async (item: MenuItem, qty: number) => {
     if (!order) return
+    // If qty is negative, we're decrementing — find the matching order item
+    // and either decrement its quantity or remove it entirely when qty falls to 0.
+    if (qty < 0) {
+      const existing = (order.items || []).find(
+        (i) => i.menuItemId === item.id && i.status !== 'cancelled'
+      )
+      if (!existing) return // nothing to decrement
+      if (existing.quantity <= 1) {
+        // Remove the item entirely
+        await removeItem(existing)
+        return
+      }
+      // Decrement by 1
+      await shopFetch(`/api/orders/${order.id}/items/${existing.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quantity: existing.quantity - 1 }),
+      })
+      setOrder((cur) => cur ? ({
+        ...cur,
+        items: (cur.items || []).map((i) => i.id === existing.id ? { ...i, quantity: i.quantity - 1 } : i),
+      }) : cur)
+      return
+    }
     const res = await shopFetch(`/api/orders/${order.id}/items`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -236,7 +302,6 @@ export default function CounterMode({ onExit, directMode, currentMode, onNavigat
     setOrder(data.order)
     const wasAlreadySent = order.status !== 'open'
     if (wasAlreadySent) {
-      // Notify kitchen an item was added to an in-progress KOT
       const newItems = (data.order.items || []).filter(
         (i: OrderItem) => !order.items!.some((oi) => oi.id === i.id)
       )
@@ -388,62 +453,50 @@ export default function CounterMode({ onExit, directMode, currentMode, onNavigat
     }
   }
 
-  // ----- Save order: create a bill + free the table (same as Bill button but no print dialog) -----
+  // ----- Save order: close it + create a bill + free the table -----
   const saveOrder = async () => {
     if (!order) return
     setBusy(true)
     try {
-      // Calculate totals from order items
-      const activeItems = (order.items || []).filter((i: any) => i.status !== 'cancelled')
-      const subtotal = activeItems.reduce((s: number, i: any) => s + Number(i.price) * Number(i.quantity), 0)
-      const taxRate = settings?.taxRate ?? 5
-      const taxAmount = subtotal * (taxRate / 100)
-      const total = Math.max(0, subtotal + taxAmount)
+      const activeItems = (order.items || []).filter((i) => i.status !== 'cancelled')
+      const subtotal = activeItems.reduce((s, i) => s + i.price * i.quantity, 0)
+      const taxRate = (currentShop as any)?.taxRate || 5
+      const taxAmount = Math.round(subtotal * taxRate) / 100
+      const total = subtotal + taxAmount
 
-      // Create a bill (this also auto-creates a MoneyIn entry + frees the table + pushes to Supabase)
-      const billRes = await shopFetch('/api/bills', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          orderId: order.id,
-          tableNumber: order.table?.number ?? 0,
-          subtotal,
-          taxRate,
-          taxAmount,
-          discount: 0,
-          serviceCharge: 0,
-          total,
-          paymentMode: 'cash',
-        }),
+      try {
+        await shopFetch('/api/bills', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            orderId: order.id,
+            subtotal,
+            taxRate,
+            taxAmount,
+            discount: 0,
+            serviceCharge: 0,
+            total,
+            paymentMode: 'cash',
+          }),
+        })
+      } catch (e) {
+        console.warn('[saveOrder] bill creation failed (non-fatal):', e)
+      }
+
+      await shopFetch(`/api/orders/${order.id}/free-table`, { method: 'POST' })
+
+      sync.sendTableReleased({
+        tableId: order.tableId,
+        tableNumber: order.table?.number || 0,
+      })
+      sync.sendOrderStatus({
+        orderId: order.id,
+        status: 'billed',
+        tableNumber: order.table?.number || 0,
       })
 
-      if (billRes.ok) {
-        const data = await billRes.json()
-        sync.sendTableReleased({ tableId: order.tableId, tableNumber: order.table?.number || 0 })
-        sync.sendOrderStatus({ orderId: order.id, status: 'paid', tableNumber: order.table?.number || 0 })
-        toast.success(`Bill #${data.bill?.billNo} saved · ₹${total.toFixed(2)}`)
-      } else {
-        await shopFetch(`/api/orders/${order.id}/free-table`, { method: 'POST' })
-        toast.success('Order saved & table freed')
-      }
-
-      // Reload tables and reset for next customer
-      await loadTables()
-      setOrder(null)
-      setPrintedItemIds(new Set())
-      setKotItemsToPrint([])
-      setKotNo(0)
-      setShowBilling(false)
-
-      if (directMode) {
-        const freshRes = await shopFetch('/api/tables')
-        const freshData = await freshRes.json()
-        const freshTables = Array.isArray(freshData?.tables) ? freshData.tables : []
-        const directTable = freshTables.find((t: any) => t.number === 0)
-        if (directTable) openTable({ ...directTable, type: 'direct' } as any)
-      } else {
-        setSelectedTable(null)
-      }
+      toast.success('Order saved & bill created')
+      closeTable()
     } catch {
       toast.error('Failed to save order')
     } finally {
@@ -576,6 +629,7 @@ export default function CounterMode({ onExit, directMode, currentMode, onNavigat
     return (
       <div className="min-h-screen img-bg">
         <Header onExit={onExit} role="counter" connected={sync.connected} currentMode={currentMode} onNavigate={onNavigate} isDirect={directMode} />
+        {onNavigate && currentMode && <GlobalShortcutBar currentMode={currentMode as any} onNavigate={onNavigate} />}
         <main className="max-w-7xl mx-auto px-4 md:px-6 py-6">
           <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
             <div>
@@ -618,163 +672,198 @@ export default function CounterMode({ onExit, directMode, currentMode, onNavigat
   const canBill = order && ['open', 'sent', 'preparing', 'ready', 'served', 'billed'].includes(order.status) &&
     (order.items || []).some((i) => i.status !== 'cancelled')
 
-  return (
-    <div className="min-h-screen img-bg flex flex-col">
-      <Header onExit={closeTable} role="counter" connected={sync.connected} backLabel="Back to tables" currentMode={currentMode} onNavigate={onNavigate} isDirect={directMode} />
-
-      <main className="flex-1 max-w-7xl mx-auto w-full px-4 md:px-6 py-4 pb-24 grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-4">
-        {/* Left: Menu picker */}
-        <div className="flex flex-col bg-white/80 backdrop-blur-md rounded-2xl border border-white/30 p-4 min-h-[60vh] shadow-sm">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="font-bold text-slate-900">Menu</h2>
-            <Badge variant="outline" className="text-[10px]">
-              {menu.filter((m) => m.available).length} items
-            </Badge>
-          </div>
-          <div className="flex-1 min-h-0">
-            <MenuPicker items={menu} onAdd={addItem} disabled={!canEdit && order?.status !== 'open' && !['sent', 'preparing', 'ready'].includes(order?.status || '')} />
-          </div>
-        </div>
-
-        {/* Right: Order cart + actions */}
-        <div className="flex flex-col gap-3">
-          {/* Order meta */}
-          <Card className="p-3 bg-white/80 backdrop-blur-md border-white/30">
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <Label className="text-[10px] text-slate-500">Guests</Label>
-                <Input
-                  type="number"
-                  min={1}
-                  value={guests}
-                  onChange={(e) => setGuests(Number(e.target.value) || 1)}
-                  disabled={!canEdit}
-                  className="mt-0.5 h-9"
-                />
-              </div>
-              <div>
-                <Label className="text-[10px] text-slate-500">Waiter</Label>
-                <Input
-                  value={waiterName}
-                  onChange={(e) => setWaiterName(e.target.value)}
-                  disabled={!canEdit}
-                  placeholder="Name"
-                  className="mt-0.5 h-9"
-                />
-              </div>
-            </div>
-            <div className="mt-2">
-              <Label className="text-[10px] text-slate-500">Order notes</Label>
-              <Textarea
-                value={orderNotes}
-                onChange={(e) => setOrderNotes(e.target.value)}
-                disabled={!canEdit}
-                placeholder="Special instructions for the whole order…"
-                rows={2}
-                className="mt-0.5 text-sm"
-              />
-            </div>
-            {order && (
-              <div className="flex items-center justify-between mt-2 text-[11px]">
-                <span className="text-slate-500">Order status</span>
-                <Badge variant="outline" className={`text-[10px] ${ORDER_STATUS_COLORS[order.status]}`}>
-                  {ORDER_STATUS_LABELS[order.status]}
-                </Badge>
-              </div>
-            )}
-          </Card>
-
-          {/* Cart */}
-          <div className="flex-1 min-h-[300px] rounded-2xl border border-white/30 overflow-hidden shadow-sm">
-            {order && (
-              <OrderCart
-                order={order}
-                onInc={incItem}
-                onDec={decItem}
-                onRemove={removeItem}
-                onAddNotes={addNotes}
-                onAddCustomItem={addItem}
-                canEdit={canEdit}
-              />
-            )}
-          </div>
-
-          {/* Delete order with reason */}
-          {order && (order.items || []).length > 0 && (
-            <Button
-              onClick={() => setShowDeleteConfirm(true)}
-              variant="outline"
-              className="w-full text-rose-600 border-rose-300 hover:bg-rose-50"
-              size="sm"
-            >
-              <Trash2 className="w-3.5 h-3.5 mr-1.5" /> Delete Order / Token
-            </Button>
-          )}
-
-          {/* Quick served action */}
-          {order && (order.items || []).some((i) => i.status === 'ready') && (
-            <Card className="p-3 bg-emerald-50 border-emerald-200">
-              <div className="flex items-center gap-2 text-xs text-emerald-700 mb-2">
-                <AlertCircle className="w-3.5 h-3.5" /> Kitchen marked these as ready — tap to confirm served
-              </div>
-              <div className="space-y-1">
-                {(order.items || [])
-                  .filter((i) => i.status === 'ready')
-                  .map((it) => (
-                    <button
-                      key={it.id}
-                      onClick={() => markServed(it)}
-                      className="w-full flex items-center justify-between text-sm bg-white px-3 py-1.5 rounded-lg border border-emerald-200 hover:bg-emerald-100"
-                    >
-                      <span>
-                        {it.quantity}× {it.name}
-                      </span>
-                      <span className="text-xs font-medium text-emerald-700 flex items-center gap-1">
-                        <CheckCircle2 className="w-3.5 h-3.5" /> Mark served
-                      </span>
-                    </button>
-                  ))}
-              </div>
-            </Card>
+  // ─── Shared "Current Order" panel content ───
+  // Rendered twice: as a fixed bottom sheet on mobile/tablet, and as a
+  // sticky sidebar to the right of the menu on large screens (lg+).
+  const renderOrderPanel = (desktop: boolean) => (
+    <div className={desktop ? 'flex flex-col h-full min-h-0 p-3 sm:p-4' : 'flex flex-col flex-1 min-h-0'}>
+      {/* Header row — title + order meta */}
+      <div className="flex items-center justify-between mb-2 gap-2 flex-wrap shrink-0">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
+          <Receipt className="w-4 h-4 text-slate-700 shrink-0" />
+          <h3 className="text-sm font-bold text-slate-900 truncate">Current Order</h3>
+          {order && (
+            <>
+              <Badge variant="outline" className={`text-[9px] shrink-0 ${ORDER_STATUS_COLORS[order.status]}`}>
+                {ORDER_STATUS_LABELS[order.status]}
+              </Badge>
+              <span className="text-[11px] text-slate-500 shrink-0">
+                {order.table?.number === 0 ? 'Direct' : `Table ${order.table?.number}`} · {(order.items || []).filter((i) => i.status !== 'cancelled').length} items
+              </span>
+            </>
           )}
         </div>
-      </main>
+      </div>
 
-      {/* Fixed bottom action bar — Save / KOT / Bill — always visible on ALL devices */}
-      <div className="fixed bottom-0 left-0 right-0 z-30 glass-fixed-bar p-2 sm:p-3 grid grid-cols-3 gap-1.5 sm:gap-2">
+      {/* Quick meta inputs */}
+      <div className={`flex items-center gap-1.5 shrink-0 mb-2 ${desktop ? 'flex-wrap' : ''}`}>
+        <Input
+          type="number"
+          min={1}
+          value={guests}
+          onChange={(e) => setGuests(Number(e.target.value) || 1)}
+          disabled={!canEdit}
+          className={desktop ? 'h-8 w-16 text-xs px-2' : 'h-7 w-12 text-[11px] px-1'}
+          title="Guests"
+        />
+        <Input
+          value={waiterName}
+          onChange={(e) => setWaiterName(e.target.value)}
+          disabled={!canEdit}
+          placeholder="Waiter"
+          className={desktop ? 'h-8 flex-1 min-w-0 text-xs px-2' : 'h-7 w-20 text-[11px] px-2'}
+        />
+      </div>
+
+      {/* Cart — always scrolls internally within whatever space is left; header/footer/buttons never move */}
+      <div className="flex-1 min-h-0 overflow-y-auto pr-1 -mr-1 thin-scrollbar">
+        {order ? (
+          <OrderCart
+            order={order}
+            onInc={incItem}
+            onDec={decItem}
+            onRemove={removeItem}
+            onAddNotes={addNotes}
+            onAddCustomItem={addItem}
+            canEdit={canEdit}
+          />
+        ) : (
+          <div className="py-4 text-center text-xs text-slate-400">No active order — start one by adding items from the menu.</div>
+        )}
+      </div>
+
+      {/* Order notes (compact) */}
+      {order && (
+        <div className="mt-2 shrink-0">
+          <Input
+            value={orderNotes}
+            onChange={(e) => setOrderNotes(e.target.value)}
+            disabled={!canEdit}
+            placeholder="Order notes (optional)…"
+            className="h-8 text-xs"
+          />
+        </div>
+      )}
+
+      {/* Action buttons — always visible */}
+      <div className="grid grid-cols-3 gap-2 mt-2 shrink-0">
         <Button
-          onClick={saveOrder}
+          onClick={() => setShowSaveConfirm(true)}
           disabled={!order || (order.items || []).length === 0 || busy}
-          className="bg-blue-600 hover:bg-blue-700 text-white h-12 sm:h-14 text-xs sm:text-sm font-bold shadow-lg"
+          className="bg-blue-600 hover:bg-blue-700 text-white h-11 shadow-lg"
         >
-          <Save className="w-4 h-4 mr-1 sm:mr-1.5" /> Save
+          <Save className="w-4 h-4 mr-1.5" /> Save
         </Button>
         <Button
           onClick={sendToKitchen}
           disabled={!canSend || busy}
-          className="bg-gradient-to-r from-orange-500 to-rose-500 hover:from-orange-600 hover:to-rose-600 text-white h-12 sm:h-14 text-xs sm:text-sm font-bold shadow-lg"
+          className="bg-gradient-to-r from-orange-500 to-rose-500 hover:from-orange-600 hover:to-rose-600 text-white h-11 shadow-lg"
         >
-          <Send className="w-4 h-4 mr-1 sm:mr-1.5" />
-          {order?.status === 'open' ? 'KOT' : 'Re-print'}
+          <Send className="w-4 h-4 mr-1.5" />
+          {order?.status === 'open' ? 'Send KOT' : 'Re-print'}
         </Button>
         <Button
           onClick={openBilling}
           disabled={!canBill}
-          className="bg-emerald-600 hover:bg-emerald-700 text-white h-12 sm:h-14 text-xs sm:text-sm font-bold shadow-lg"
+          className="bg-slate-900 hover:bg-slate-800 text-white h-11 shadow-lg"
         >
-          <Receipt className="w-4 h-4 mr-1 sm:mr-1.5" /> Bill
+          <Receipt className="w-4 h-4 mr-1.5" /> Bill
         </Button>
       </div>
 
-      {/* KOT print preview — 2 copies: Kitchen + Customer */}
+      {/* Delete + served actions row */}
+      {order && (order.items || []).length > 0 && (
+        <div className="flex gap-2 mt-1.5 shrink-0">
+          <Button
+            onClick={() => setShowDeleteConfirm(true)}
+            variant="outline"
+            className="flex-1 text-rose-600 border-rose-300 hover:bg-rose-50 h-8"
+            size="sm"
+          >
+            <Trash2 className="w-3 h-3 mr-1" /> Delete Order
+          </Button>
+          {(order.items || []).some((i) => i.status === 'ready') && (
+            <Button
+              onClick={() => {
+                const ready = (order.items || []).find((i) => i.status === 'ready')
+                if (ready) markServed(ready)
+              }}
+              variant="outline"
+              className="flex-1 text-emerald-700 border-emerald-300 hover:bg-emerald-50 h-8"
+              size="sm"
+            >
+              <CheckCircle2 className="w-3 h-3 mr-1" /> Mark Served
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+
+  return (
+    <div className="h-dvh img-bg flex flex-col overflow-hidden">
+      <div className="shrink-0">
+        <Header
+          onExit={directMode ? onExit : closeTable}
+          role="counter"
+          connected={sync.connected}
+          backLabel={directMode ? 'Exit' : 'Back to tables'}
+          currentMode={currentMode}
+          onNavigate={onNavigate}
+          isDirect={directMode}
+        />
+        {onNavigate && currentMode && <GlobalShortcutBar currentMode={currentMode as any} onNavigate={onNavigate} />}
+      </div>
+
+      {/* Main content fills the remaining viewport height — this level never scrolls; */}
+      {/* only the menu list and the order item list scroll inside their own boxes. */}
+      <main className="flex-1 min-h-0 max-w-7xl mx-auto w-full px-3 sm:px-4 md:px-6 py-4 overflow-hidden">
+        {/* On lg+ screens: Menu on the left, Current Order sidebar on the right. */}
+        {/* On smaller screens: Menu fills the space above the always-visible order bar (below). */}
+        <div className="flex flex-col h-full min-h-0 lg:grid lg:grid-cols-[1fr_360px] xl:grid-cols-[1fr_400px] lg:grid-rows-[minmax(0,1fr)] lg:gap-4">
+          {/* Menu picker */}
+          <div className="flex flex-col flex-1 min-h-0 lg:h-full bg-white/80 backdrop-blur-md rounded-2xl border border-white/30 p-4 shadow-sm overflow-hidden">
+            <div className="flex items-center justify-between mb-3 shrink-0">
+              <h2 className="font-bold text-slate-900">Menu</h2>
+              <Badge variant="outline" className="text-[10px]">
+                {menu.filter((m) => m.available).length} items
+              </Badge>
+            </div>
+            <div className="flex-1 min-h-0">
+              <MenuPicker
+                items={menu}
+                onAdd={addItem}
+                orderItems={order?.items}
+                disabled={!canEdit && order?.status !== 'open' && !['sent', 'preparing', 'ready'].includes(order?.status || '')}
+              />
+            </div>
+          </div>
+
+          {/* Current Order — right of the menu (desktop / large tablets only), stretches to full height with its own internal scroll */}
+          <div className="hidden lg:flex lg:flex-col lg:h-full bg-white/95 backdrop-blur-xl rounded-2xl border border-slate-200 shadow-xl overflow-hidden">
+            {renderOrderPanel(true)}
+          </div>
+        </div>
+      </main>
+
+      {/* ─── Bottom order bar (mobile & tablet only) ─── */}
+      {/* Always docked at the bottom of the screen — never covered, never needs page scroll to reach. */}
+      {/* Its own item list scrolls internally; header, subtotal & the 3 action buttons never move. */}
+      {/* Hidden on lg+ where the sidebar above takes over. */}
+      <div className="shrink-0 lg:hidden max-h-[65vh] flex flex-col bg-white/95 backdrop-blur-xl border-t border-slate-200 shadow-2xl z-30">
+        <div className="max-w-7xl mx-auto px-3 sm:px-6 py-2.5 w-full flex flex-col flex-1 min-h-0">
+          {renderOrderPanel(false)}
+        </div>
+      </div>
+
+      {/* KOT print preview — single copy (Kitchen Copy only) */}
       <PrintPreview
         open={showKOT}
         onClose={() => setShowKOT(false)}
         title={`KOT ${kotNo > 1 ? `(Reprint #${kotNo})` : ''} — ${order?.table?.number === 0 ? 'Direct Order' : 'Table ' + order?.table?.number}`}
-        subtitle={kotNo > 1 ? 'Only NEW items since last print' : '2 copies will print'}
+        subtitle={kotNo > 1 ? 'Only NEW items since last print' : 'Kitchen copy'}
         copies={[
           { label: 'Kitchen Copy', banner: '*** KITCHEN COPY ***' },
-          { label: 'Customer Copy', banner: '*** CUSTOMER COPY ***' },
         ]}
       >
         {order && (
@@ -795,10 +884,93 @@ export default function CounterMode({ onExit, directMode, currentMode, onNavigat
         onClose={() => setShowBilling(false)}
         onConfirm={confirmBill}
         onAfterBill={() => {
-          // After billing, exit the table
-          setTimeout(() => closeTable(), 500)
+          // Fires only once the cashier closes the print preview — exit the table now
+          closeTable()
         }}
       />
+
+
+
+      {/* ─── Save Confirmation dialog — shows order details before saving ─── */}
+      {showSaveConfirm && order && (() => {
+        const activeItems = (order.items || []).filter((i) => i.status !== 'cancelled')
+        const subtotal = activeItems.reduce((s, i) => s + i.price * i.quantity, 0)
+        const taxRate = (currentShop as any)?.taxRate || 5
+        const taxAmount = Math.round(subtotal * taxRate) / 100
+        const total = subtotal + taxAmount
+        return (
+          <div className="fixed inset-0 z-50 bg-slate-900/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowSaveConfirm(false)}>
+            <motion.div
+              className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-5"
+              initial={{ scale: 0.96, y: 12 }}
+              animate={{ scale: 1, y: 0 }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center">
+                  <Save className="w-5 h-5 text-blue-600" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900">Confirm & Save Order</h3>
+                  <p className="text-xs text-slate-500">
+                    {order.table?.number === 0 ? 'Direct Order' : `Table ${order.table?.number}`} · {activeItems.length} items
+                  </p>
+                </div>
+              </div>
+
+              <div className="bg-slate-50 rounded-lg p-3 mb-3 max-h-[40vh] overflow-y-auto">
+                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wide mb-2">Order Items</p>
+                {activeItems.length === 0 ? (
+                  <p className="text-xs text-slate-400 text-center py-3">No items in order</p>
+                ) : (
+                  <div className="space-y-1.5">
+                    {activeItems.map((it) => (
+                      <div key={it.id} className="flex items-start justify-between text-xs">
+                        <div className="flex-1 min-w-0">
+                          <p className="font-medium text-slate-800 truncate">{it.quantity}× {it.name}</p>
+                          {it.notes && <p className="text-[10px] text-slate-400 italic truncate">↳ {it.notes}</p>}
+                        </div>
+                        <p className="font-semibold text-slate-700 ml-2 shrink-0">{formatCurrency(it.price * it.quantity)}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-1 text-sm mb-4">
+                <div className="flex justify-between text-slate-600">
+                  <span>Subtotal</span>
+                  <span className="font-medium">{formatCurrency(subtotal)}</span>
+                </div>
+                <div className="flex justify-between text-slate-600">
+                  <span>Tax ({taxRate}%)</span>
+                  <span className="font-medium">{formatCurrency(taxAmount)}</span>
+                </div>
+                <div className="flex justify-between pt-2 border-t border-slate-200 mt-2">
+                  <span className="font-bold text-slate-900">Total</span>
+                  <span className="font-bold text-blue-600 text-base">{formatCurrency(total)}</span>
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <Button variant="outline" onClick={() => setShowSaveConfirm(false)} className="flex-1">
+                  Cancel
+                </Button>
+                <Button
+                  onClick={async () => {
+                    setShowSaveConfirm(false)
+                    await saveOrder()
+                  }}
+                  disabled={busy}
+                  className="flex-1 bg-blue-600 hover:bg-blue-700 text-white"
+                >
+                  {busy ? <><Loader2 className="w-4 h-4 mr-1.5 animate-spin" /> Saving…</> : <><CheckCircle2 className="w-4 h-4 mr-1.5" /> Confirm & Save</>}
+                </Button>
+              </div>
+            </motion.div>
+          </div>
+        )
+      })()}
 
       {/* Delete order confirmation with reason */}
       {showDeleteConfirm && (
@@ -887,10 +1059,6 @@ function Header({
           <Button variant="ghost" size="sm" onClick={onExit} className="shrink-0">
             <ArrowLeft className="w-4 h-4 mr-1" /> <span className="hidden sm:inline">{backLabel}</span>
           </Button>
-          {/* Inline shortcut bar — between back button and sign out */}
-          {onNavigate && currentMode && (
-            <GlobalShortcutBarInline currentMode={currentMode as any} onNavigate={onNavigate} />
-          )}
           <div className="hidden md:block w-px h-6 bg-slate-200" />
           <div className={`hidden md:flex w-9 h-9 rounded-xl ${l.color} items-center justify-center`}>
             <DisplayIcon className="w-5 h-5 text-white" />

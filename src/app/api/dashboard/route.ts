@@ -34,6 +34,7 @@ export async function GET(req: Request) {
     lowStockItems,
     occupiedTables,
     totalTables,
+    todayDeletedBills,
   ] = await Promise.all([
     db.bill.aggregate({ _sum: { total: true }, _count: true, where: { shopId, paidAt: { gte: today } } }),
     db.bill.aggregate({ _sum: { total: true }, _count: true, where: { shopId, paidAt: { gte: monthStart } } }),
@@ -56,8 +57,15 @@ export async function GET(req: Request) {
     db.moneyOut.aggregate({ _sum: { amount: true }, where: { shopId, date: { gte: today } } }),
     db.purchase.aggregate({ _sum: { total: true }, where: { shopId, createdAt: { gte: today } } }),
     db.menuItem.findMany({ where: { shopId, stock: { lte: 5 } }, orderBy: { stock: 'asc' }, take: 5 }),
-    db.restaurantTable.count({ where: { shopId, status: 'occupied' } }),
-    db.restaurantTable.count({ where: { shopId } }),
+    db.restaurantTable.count({ where: { shopId, status: 'occupied', number: { gt: 0 } } }),
+    db.restaurantTable.count({ where: { shopId, number: { gt: 0 } } }),
+    // Deleted bills attributed by originalPaidAt so a bill paid yesterday
+    // but voided today still counts against yesterday's revenue.
+    db.deletedBill.aggregate({
+      _sum: { total: true },
+      _count: true,
+      where: { shopId, originalPaidAt: { gte: today } },
+    }),
   ])
 
   const dayMap = new Map<string, number>()
@@ -90,18 +98,26 @@ export async function GET(req: Request) {
   })
   const topItems = Array.from(itemMap.values()).sort((a, b) => b.qty - a.qty).slice(0, 5)
 
+  // Total of bills voided today (attributed by original paidAt) — exposed
+  // as its own metric AND subtracted from net cash flow because a voided
+  // sale is effectively money that left the till.
+  const deletedBillAmount = todayDeletedBills._sum.total || 0
+  const deletedBillCount = todayDeletedBills._count || 0
+
   const cashFlow = {
     salesIn: todayBills._sum.total || 0,
     otherIn: todayMoneyIn._sum.amount || 0,
     expenses: todayExpenses._sum.amount || 0,
     purchases: todayPurchases._sum.total || 0,
     otherOut: todayMoneyOut._sum.amount || 0,
+    deletedBills: deletedBillAmount,
     net:
       (todayBills._sum.total || 0) +
       (todayMoneyIn._sum.amount || 0) -
       (todayExpenses._sum.amount || 0) -
       (todayPurchases._sum.total || 0) -
-      (todayMoneyOut._sum.amount || 0),
+      (todayMoneyOut._sum.amount || 0) -
+      deletedBillAmount,
   }
 
   return NextResponse.json({
@@ -132,6 +148,9 @@ export async function GET(req: Request) {
     topItems,
     recentBills,
     lowStock: lowStockItems,
+    // Exposed as its own block so the dashboard UI can render a
+    // "Deleted Bills" stat card.
+    deletedBills: { amount: deletedBillAmount, count: deletedBillCount },
     cashFlow,
   })
 }

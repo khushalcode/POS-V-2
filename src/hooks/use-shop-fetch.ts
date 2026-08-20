@@ -4,7 +4,9 @@ import { useCallback } from 'react'
 import { useSession } from '@/lib/session'
 import {
   menu, tables, orders, bills, settings, users, dashboard,
-  zomato, audit, syncQueue, shops,
+  zomato, audit, syncQueue,
+  shops, customers, suppliers, purchases, expenses, moneyIn, moneyOut, reports,
+  deletedBills, menuCategories,
 } from '@/lib/client-data'
 
 /**
@@ -23,6 +25,7 @@ interface FakeResponse {
   status: number
   json: () => Promise<any>
   text: () => Promise<string>
+  [k: string]: any
 }
 
 function fakeResponse(data: any, status = 200): FakeResponse {
@@ -48,9 +51,7 @@ export function useShopFetch() {
     const body = parseBody(typeof options.body === 'string' ? options.body : undefined)
 
     // ─── MENU ───
-    // /api/menu (optionally with query string like ?category=Drinks)
-    const menuMatch0 = url.match(/^\/api\/menu(\?.*)?$/)
-    if (menuMatch0) {
+    if (url === '/api/menu' || url === '/api/menu/') {
       if (method === 'GET') return fakeResponse({ items: menu.list(shopId) })
       if (method === 'POST') return fakeResponse({ item: menu.create(shopId, body) }, 201)
     }
@@ -62,41 +63,63 @@ export function useShopFetch() {
       if (method === 'DELETE') { menu.delete(id); return fakeResponse({ ok: true }) }
     }
 
+    // ─── MENU CATEGORIES ──────────────────────────────────────────────
+    // Per-shop, user-manageable categories. Backed by the menuCategories
+    // export in client-data.ts (which uses the MenuCategory table created
+    // in client-db.ts SCHEMA_SQL + migrateSchema).
+    if (url === '/api/menu-categories' || url.startsWith('/api/menu-categories?')) {
+      if (method === 'GET') {
+        try {
+          const cats = menuCategories.list(shopId)
+          return fakeResponse({ categories: cats })
+        } catch (e: any) {
+          console.error('[shopFetch] menu-categories GET error:', e)
+          return fakeResponse({ error: e?.message || 'Failed to load categories' }, 500)
+        }
+      }
+      if (method === 'POST') {
+        try {
+          const created = menuCategories.create(shopId, body)
+          return fakeResponse({ category: created }, 201)
+        } catch (e: any) {
+          const msg = e?.message || 'Failed to create category'
+          const status = msg.includes('already exists') ? 409 : 400
+          return fakeResponse({ error: msg }, status)
+        }
+      }
+    }
+    // /api/menu-categories/[id]
+    const menuCatMatch = url.match(/^\/api\/menu-categories\/([^/]+)$/)
+    if (menuCatMatch) {
+      const id = menuCatMatch[1]
+      if (method === 'PUT') {
+        try {
+          const updated = menuCategories.update(id, body)
+          return fakeResponse({ category: updated })
+        } catch (e: any) {
+          const msg = e?.message || 'Failed to update category'
+          const status = msg.includes('not found') ? 404 : msg.includes('already has') ? 409 : 400
+          return fakeResponse({ error: msg }, status)
+        }
+      }
+      if (method === 'DELETE') {
+        try {
+          const result = menuCategories.delete(id)
+          return fakeResponse({ ok: true, ...result })
+        } catch (e: any) {
+          const msg = e?.message || 'Failed to delete category'
+          const status = msg.includes('not found') ? 404 : 400
+          return fakeResponse({ error: msg }, status)
+        }
+      }
+    }
+
     // ─── TABLES ───
-    // Support fetching tables for ANY shop (not just the current session shop)
-    // via /api/tables?shopId=XXX — used by the admin Shops & Tables management page.
-    const tablesWithShopId = url.match(/^\/api\/tables\?shopId=(.+)$/)
-    if (tablesWithShopId && method === 'GET') {
-      return fakeResponse({ tables: tables.list(decodeURIComponent(tablesWithShopId[1])) })
-    }
     if (url === '/api/tables' && method === 'GET') return fakeResponse({ tables: tables.list(shopId) })
-    if (url === '/api/tables' && method === 'POST') {
-      try {
-        // Use shopId from body if provided (admin managing other shops), else session shopId
-        return fakeResponse({ table: tables.create(body.shopId || shopId, body) }, 201)
-      } catch (e: any) {
-        return fakeResponse({ error: e?.message || 'Failed to create table' }, 400)
-      }
-    }
-    if (url === '/api/tables' && method === 'PUT') {
-      try {
-        return fakeResponse({ table: tables.update(body.id, body) })
-      } catch (e: any) {
-        return fakeResponse({ error: e?.message || 'Failed to update table' }, 400)
-      }
-    }
+    if (url === '/api/tables' && method === 'POST') return fakeResponse({ table: { id: 'new' } }, 201)
     if (url === '/api/tables/seed' && method === 'POST') {
       tables.seed(shopId)
       return fakeResponse({ seeded: true, tables: tables.list(shopId) })
-    }
-    const tableDelMatch = url.match(/^\/api\/tables\?id=(.+)$/)
-    if (tableDelMatch && method === 'DELETE') {
-      try {
-        tables.delete(tableDelMatch[1])
-        return fakeResponse({ ok: true })
-      } catch (e: any) {
-        return fakeResponse({ error: e?.message || 'Failed to delete table' }, 400)
-      }
     }
 
     // ─── ORDERS ───
@@ -152,9 +175,21 @@ export function useShopFetch() {
     // ─── BILLS ───
     if (url.startsWith('/api/bills?') || (url === '/api/bills' && method === 'GET')) {
       const params = new URLSearchParams(url.split('?')[1] || '')
+      const billsList = bills.list(shopId, { from: params.get('from') || undefined, to: params.get('to') || undefined, table: params.get('table') ? Number(params.get('table')) : undefined, q: params.get('q') || undefined })
+      // ─── Compute summary from the filtered bills list ───
+      // Previously this was hardcoded to { totalRevenue: 0, totalBills: 0 },
+      // which meant the History / Dashboard stat cards always showed ₹0 even
+      // when bills existed with correct totals.
+      const totalRevenue = billsList.reduce((s: number, b: any) => s + (Number(b.total) || 0), 0)
+      const totalBills = billsList.length
+      const byPayment: Record<string, number> = {}
+      for (const b of billsList) {
+        const mode = b.paymentMode || 'other'
+        byPayment[mode] = (byPayment[mode] || 0) + (Number(b.total) || 0)
+      }
       return fakeResponse({
-        bills: bills.list(shopId, { from: params.get('from') || undefined, to: params.get('to') || undefined, table: params.get('table') ? Number(params.get('table')) : undefined, q: params.get('q') || undefined }),
-        summary: { totalRevenue: 0, totalBills: 0, byPayment: {} },
+        bills: billsList,
+        summary: { totalRevenue, totalBills, byPayment },
       })
     }
     if (url === '/api/bills' && method === 'POST') {
@@ -166,8 +201,36 @@ export function useShopFetch() {
     if (url === '/api/bills/next-no' && method === 'GET') {
       return fakeResponse({ nextNo: bills.nextNo(shopId) })
     }
+    // GET /api/bills/deleted — list all voided bills for the current shop.
+    // MUST be matched BEFORE the /api/bills/[id] route below, otherwise
+    // "deleted" would be treated as a bill id.
+    if ((url === '/api/bills/deleted' || url.startsWith('/api/bills/deleted?')) && method === 'GET') {
+      const params = new URLSearchParams(url.split('?')[1] || '')
+      const list = deletedBills.list(shopId, {
+        from: params.get('from') || undefined,
+        to: params.get('to') || undefined,
+      })
+      const totals = deletedBills.totals(shopId, {
+        from: params.get('from') || undefined,
+        to: params.get('to') || undefined,
+      })
+      return fakeResponse({ items: list, totals })
+    }
     const billMatch = url.match(/^\/api\/bills\/([^/]+)$/)
     if (billMatch && method === 'GET') return fakeResponse({ bill: bills.getById(billMatch[1]) })
+    // DELETE /api/bills/[id] — void a bill. Body: { reason, deletedBy, deletedById }.
+    // The bills.delete() helper captures a snapshot into DeletedBill, reverses
+    // the auto-added MoneyIn, frees the table, writes an audit log entry, and
+    // finally removes the Bill row.
+    if (billMatch && method === 'DELETE') {
+      const ok = bills.delete(billMatch[1], {
+        reason: body.reason,
+        deletedBy: body.deletedBy,
+        deletedById: body.deletedById,
+      })
+      if (!ok) return fakeResponse({ error: 'Bill not found' }, 404)
+      return fakeResponse({ ok: true })
+    }
 
     // ─── SETTINGS ───
     if (url === '/api/settings' && method === 'GET') return fakeResponse({ settings: settings.get(shopId) })
@@ -203,7 +266,7 @@ export function useShopFetch() {
     }
 
     // ─── AUDIT ───
-    if (url === '/api/audit' && method === 'GET') {
+    if ((url === '/api/audit' || url.startsWith('/api/audit?')) && method === 'GET') {
       const params = new URLSearchParams(url.split('?')[1] || '')
       return fakeResponse({ logs: audit.list(shopId, params.get('action') || undefined) })
     }
@@ -215,47 +278,112 @@ export function useShopFetch() {
     // ─── AUTO-SEED ───
     if (url === '/api/auto-seed') return fakeResponse({ seeded: false, message: 'Database already initialized' })
 
-    // ─── CUSTOMERS / SUPPLIERS / EXPENSES / etc. ───
-    // These are less critical — return empty for now
-    if (url.startsWith('/api/customers')) return fakeResponse({ customers: [] })
-    if (url.startsWith('/api/suppliers')) return fakeResponse({ suppliers: [] })
-    if (url.startsWith('/api/purchases')) return fakeResponse({ purchases: [] })
-    if (url.startsWith('/api/expenses')) return fakeResponse({ expenses: [] })
-    if (url.startsWith('/api/moneyin')) return fakeResponse({ items: [] })
-    if (url.startsWith('/api/moneyout')) return fakeResponse({ items: [] })
-    if (url.startsWith('/api/reports')) return fakeResponse({ summary: { salesRevenue: 0, totalExpenses: 0, totalPurchases: 0, netProfit: 0, cashFlow: 0, billCount: 0, avgBill: 0 }, byPayment: {}, topItems: [], expenseByCategory: {}, dailyBreakdown: [], bills: [] })
+    // ─── CUSTOMERS ───
+    if ((url === '/api/customers' || url.startsWith('/api/customers?')) && method === 'GET') return fakeResponse({ customers: customers.list(shopId) })
+    if (url === '/api/customers' && method === 'POST') return fakeResponse({ customer: customers.create(shopId, body) }, 201)
+    const custMatch = url.match(/^\/api\/customers\/([^/?]+)$/)
+    if (custMatch) {
+      if (method === 'PUT') { customers.update(custMatch[1], body); return fakeResponse({ ok: true }) }
+      if (method === 'DELETE') { customers.delete(custMatch[1]); return fakeResponse({ ok: true }) }
+    }
+    const custDelMatch = url.match(/^\/api\/customers\?id=(.+)$/)
+    if (custDelMatch && method === 'DELETE') { customers.delete(custDelMatch[1]); return fakeResponse({ ok: true }) }
+
+    // ─── SUPPLIERS ───
+    if ((url === '/api/suppliers' || url.startsWith('/api/suppliers?')) && method === 'GET') return fakeResponse({ suppliers: suppliers.list(shopId) })
+    if (url === '/api/suppliers' && method === 'POST') return fakeResponse({ supplier: suppliers.create(shopId, body) }, 201)
+    const suppMatch = url.match(/^\/api\/suppliers\/([^/?]+)$/)
+    if (suppMatch) {
+      if (method === 'PUT') { suppliers.update(suppMatch[1], body); return fakeResponse({ ok: true }) }
+      if (method === 'DELETE') { suppliers.delete(suppMatch[1]); return fakeResponse({ ok: true }) }
+    }
+    const suppDelMatch = url.match(/^\/api\/suppliers\?id=(.+)$/)
+    if (suppDelMatch && method === 'DELETE') { suppliers.delete(suppDelMatch[1]); return fakeResponse({ ok: true }) }
+
+    // ─── PURCHASES ───
+    if (url === '/api/purchases' && method === 'GET') return fakeResponse({ purchases: purchases.list(shopId) })
+    if (url === '/api/purchases' && method === 'POST') return fakeResponse({ purchase: purchases.create(shopId, body) }, 201)
+    const purchMatch = url.match(/^\/api\/purchases\?id=(.+)$/)
+    if (purchMatch && method === 'DELETE') { purchases.delete(purchMatch[1]); return fakeResponse({ ok: true }) }
+
+    // ─── EXPENSES ───
+    if (url === '/api/expenses' && method === 'GET') return fakeResponse({ expenses: expenses.list(shopId) })
+    if (url === '/api/expenses' && method === 'POST') return fakeResponse({ expense: expenses.create(shopId, body) }, 201)
+    const expMatch = url.match(/^\/api\/expenses\?id=(.+)$/)
+    if (expMatch && method === 'DELETE') { expenses.delete(expMatch[1]); return fakeResponse({ ok: true }) }
+
+    // ─── MONEY IN ───
+    if (url === '/api/moneyin' && method === 'GET') return fakeResponse({ items: moneyIn.list(shopId) })
+    if (url === '/api/moneyin' && method === 'POST') return fakeResponse({ item: moneyIn.create(shopId, body) }, 201)
+    const miMatch = url.match(/^\/api\/moneyin\?id=(.+)$/)
+    if (miMatch && method === 'DELETE') { moneyIn.delete(miMatch[1]); return fakeResponse({ ok: true }) }
+
+    // ─── MONEY OUT ───
+    if (url === '/api/moneyout' && method === 'GET') return fakeResponse({ items: moneyOut.list(shopId) })
+    if (url === '/api/moneyout' && method === 'POST') return fakeResponse({ item: moneyOut.create(shopId, body) }, 201)
+    const moMatch = url.match(/^\/api\/moneyout\?id=(.+)$/)
+    if (moMatch && method === 'DELETE') { moneyOut.delete(moMatch[1]); return fakeResponse({ ok: true }) }
+
+    // ─── REPORTS ───
+    if (url.startsWith('/api/reports')) {
+      const params = new URLSearchParams(url.split('?')[1] || '')
+      // Build a filters object from query params. Supports the advanced
+      // filter set: from, to, paymentMode, table, billNo, item, category,
+      // waiter, minAmount, maxAmount. Old callers passing just from/to
+      // still work because reports.get() accepts (shopId, from, to) too.
+      const filters: any = {}
+      if (params.get('from')) filters.from = params.get('from')!
+      if (params.get('to')) filters.to = params.get('to')!
+      if (params.get('paymentMode') && params.get('paymentMode') !== 'all') filters.paymentMode = params.get('paymentMode')!
+      if (params.get('table')) filters.tableNumber = Number(params.get('table'))
+      if (params.get('billNo')) filters.billNoSearch = params.get('billNo')
+      if (params.get('item')) filters.itemSearch = params.get('item')
+      if (params.get('category') && params.get('category') !== 'all') filters.category = params.get('category')!
+      if (params.get('waiter')) filters.waiter = params.get('waiter')
+      if (params.get('minAmount')) filters.minAmount = Number(params.get('minAmount'))
+      if (params.get('maxAmount')) filters.maxAmount = Number(params.get('maxAmount'))
+      return fakeResponse(reports.get(shopId, filters))
+    }
+
     // ─── SHOPS ───
-    // Always returns ALL shops (active + inactive) so the admin can manage them.
-    // Use a dedicated URL `/api/shops?all=1` to bypass shopId scoping — but since
-    // useShopFetch() captures shopId from session, we just bypass it here.
-    if (url.startsWith('/api/shops') && method === 'GET') {
-      return fakeResponse({ shops: shops.list() })
+    if (url === '/api/shops' && method === 'GET') return fakeResponse({ shops: shops.list() })
+    if (url === '/api/shops' && method === 'POST') return fakeResponse({ shop: shops.create(body) }, 201)
+    const shopMatch = url.match(/^\/api\/shops\/([^/]+)$/)
+    if (shopMatch) {
+      if (method === 'PUT') return fakeResponse({ shop: shops.update(shopMatch[1], body) })
+      if (method === 'DELETE') { shops.delete(shopMatch[1]); return fakeResponse({ ok: true }) }
     }
-    if (url === '/api/shops' && method === 'POST') {
-      try {
-        return fakeResponse({ shop: shops.create(body) }, 201)
-      } catch (e: any) {
-        return fakeResponse({ error: e?.message || 'Failed to create shop' }, 400)
-      }
-    }
-    if (url === '/api/shops' && method === 'PUT') {
-      try {
-        return fakeResponse({ shop: shops.update(body.id, body) })
-      } catch (e: any) {
-        return fakeResponse({ error: e?.message || 'Failed to update shop' }, 400)
-      }
-    }
-    const shopDelMatch = url.match(/^\/api\/shops\?id=(.+)$/)
-    if (shopDelMatch && method === 'DELETE') {
-      try {
-        shops.delete(shopDelMatch[1])
-        return fakeResponse({ ok: true })
-      } catch (e: any) {
-        return fakeResponse({ error: e?.message || 'Failed to delete shop' }, 400)
-      }
-    }
+
     if (url.startsWith('/api/stats')) return fakeResponse({ totalRevenue: 0, totalBills: 0 })
-    if (url.startsWith('/api/backup')) return fakeResponse({})
+    if (url.startsWith('/api/backup')) {
+      if (method === 'GET') {
+        // Gather ALL local data for backup. Data is collected across every
+        // shop in the system so a single backup file fully restores state.
+        const allShops = shops.list()
+        const perShop = (selector: (sid: string) => any[]) =>
+          allShops.flatMap((s: any) => selector(s.id))
+        const backup = {
+          version: 2,
+          exportedAt: new Date().toISOString(),
+          shops: allShops,
+          menuItems: perShop((sid) => menu.list(sid)),
+          tables: perShop((sid) => tables.list(sid)),
+          orders: perShop((sid) => orders.list(sid)),
+          bills: perShop((sid) => bills.list(sid)),
+          customers: perShop((sid) => customers.list(sid)),
+          suppliers: perShop((sid) => suppliers.list(sid)),
+          purchases: perShop((sid) => purchases.list(sid)),
+          expenses: perShop((sid) => expenses.list(sid)),
+          moneyIn: perShop((sid) => moneyIn.list(sid)),
+          moneyOut: perShop((sid) => moneyOut.list(sid)),
+          settings: allShops.map((s: any) => settings.get(s.id)).filter(Boolean),
+          users: users.list(),
+        }
+        return fakeResponse(backup)
+      }
+      // POST = restore — handled separately, fall through.
+      return fakeResponse({ ok: true })
+    }
 
     console.warn('[shopFetch] Unknown URL:', url, method)
     return fakeResponse({ error: 'Not found' }, 404)

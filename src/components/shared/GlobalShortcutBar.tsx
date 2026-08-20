@@ -50,10 +50,10 @@ export function GlobalShortcutBar({ currentMode, onNavigate, inline = false }: G
     )
   }
 
-  // Full-width sticky bar version (for landing page)
+  // Full-width bar version — sits directly under a page's header, same style everywhere
   return (
-    <div className="sticky top-[52px] sm:top-[56px] z-40 bg-slate-900/95 backdrop-blur-xl border-b border-white/10">
-      <div className="max-w-7xl mx-auto px-2 sm:px-4 py-2 flex items-center justify-start sm:justify-center gap-1.5 sm:gap-2 overflow-x-auto">
+    <div className="relative z-20 bg-slate-900/95 backdrop-blur-xl border-b border-white/10">
+      <div className="max-w-7xl mx-auto px-2 sm:px-4 py-2 flex items-center justify-center gap-1.5 sm:gap-2 overflow-x-auto">
         {shortcuts.map((s) => {
           const isActive = currentMode === s.mode
           return (

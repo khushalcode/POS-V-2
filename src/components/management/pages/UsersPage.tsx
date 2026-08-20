@@ -40,13 +40,14 @@ export default function UsersPage() {
     try {
       const res = await shopFetch('/api/users')
       const data = await res.json()
-      setUsers(data.users)
-      // If user is super admin (no shopId), also fetch shops for assignment
+      setUsers(data.users || [])
       if (!currentUser?.shopId) {
-        const sRes = await fetch('/api/shops')
+        const sRes = await shopFetch('/api/shops')
         const sData = await sRes.json()
-        setShops(sData.shops)
+        setShops(sData.shops || [])
       }
+    } catch (e) {
+      console.error('[UsersPage] load failed:', e)
     } finally {
       setLoading(false)
     }
@@ -255,11 +256,11 @@ function UserForm({
   onSubmit: (d: any) => Promise<void>
   onCancel: () => void
 }) {
-  const [f, setF] = useState({
+  const [f, setF] = useState<{ name: string; email: string; password: string; role: 'admin' | 'staff' | 'kitchen'; active: boolean; shopId: string }>({
     name: initial?.name || '',
     email: initial?.email || '',
     password: '',
-    role: initial?.role || 'staff',
+    role: (initial?.role as 'admin' | 'staff' | 'kitchen') || 'staff',
     active: initial?.active ?? true,
     shopId: initial?.shopId || (shops[0]?.id ?? ''),
   })
@@ -316,7 +317,7 @@ function UserForm({
       <div className="grid grid-cols-2 gap-3">
         <div className="space-y-1.5">
           <Label className="text-xs">Role</Label>
-          <Select value={f.role} onValueChange={(v) => setF({ ...f, role: v as 'admin' | 'staff' | 'kitchen' })}>
+          <Select value={f.role} onValueChange={(v: string) => setF({ ...f, role: v as 'admin' | 'staff' | 'kitchen' })}>
             <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
             <SelectContent>
               <SelectItem value="admin">Administrator</SelectItem>

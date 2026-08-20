@@ -95,7 +95,7 @@ export interface KOTPayload {
   orderId: string
   tableNumber: number
   tableName: string
-  type: 'dine_in' | 'takeaway' | 'direct'
+  type: 'dine_in' | 'takeaway'
   guests: number
   waiterName?: string | null
   notes?: string | null

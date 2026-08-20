@@ -5,7 +5,7 @@ import { motion } from 'framer-motion'
 import {
   Store, Receipt, Save, Loader2, RotateCcw, Palette, Type, Eye, EyeOff,
   AlignLeft, AlignCenter, AlignRight, FileText, ChefHat, Bike, Link as LinkIcon,
-  ShieldCheck, AlertCircle, Copy,
+  ShieldCheck, AlertCircle, Copy, Printer, Zap,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -21,6 +21,94 @@ import { useShopFetch } from '@/hooks/use-shop-fetch'
 import { useSession } from '@/lib/session'
 import type { ShopSettings } from '@/lib/types'
 import { BillReceiptPreview } from '@/components/shared/StylePreviews'
+
+// ─── Thermal printer presets ───────────────────────────────────────────
+// A "preset" is a one-tap configuration for a specific thermal printer
+// model. The Retsol 8TUEP is a popular 80mm USB thermal printer in India;
+// its sweet spot for crisp, legible receipts is 80mm paper / 11px font /
+// 4mm margin / 1 copy. The "Apply" button just fills those values into
+// the form — the user can still tweak individual fields afterward.
+interface PrinterPreset {
+  id: string
+  name: string
+  description: string
+  values: {
+    paperWidth: number
+    printFontSize: number
+    printMargin: number
+    billCopies: number
+    autoPrint: boolean
+    silentPrint: boolean
+  }
+}
+
+const PRINTER_PRESETS: PrinterPreset[] = [
+  {
+    id: 'retsol-8tuep',
+    name: 'Retsol 8TUEP (80mm USB Thermal)',
+    description: '80mm paper · 11px font · 4mm margin · 1 copy · auto-print on',
+    values: {
+      paperWidth: 80,
+      printFontSize: 11,
+      printMargin: 4,
+      billCopies: 1,
+      autoPrint: true,
+      silentPrint: false,
+    },
+  },
+  {
+    id: 'retsol-rtp-82',
+    name: 'Retsol RTP-82 (80mm Bluetooth Thermal)',
+    description: '80mm paper · 11px font · 4mm margin · 1 copy · auto-print on',
+    values: {
+      paperWidth: 80,
+      printFontSize: 11,
+      printMargin: 4,
+      billCopies: 1,
+      autoPrint: true,
+      silentPrint: false,
+    },
+  },
+  {
+    id: 'epson-tm-t82',
+    name: 'Epson TM-T82 (80mm USB Thermal)',
+    description: '80mm paper · 12px font · 4mm margin · 1 copy · auto-print on',
+    values: {
+      paperWidth: 80,
+      printFontSize: 12,
+      printMargin: 4,
+      billCopies: 1,
+      autoPrint: true,
+      silentPrint: false,
+    },
+  },
+  {
+    id: 'xprinter-58',
+    name: 'Xprinter 58mm (Compact Thermal)',
+    description: '58mm paper · 10px font · 3mm margin · 1 copy · auto-print on',
+    values: {
+      paperWidth: 58,
+      printFontSize: 10,
+      printMargin: 3,
+      billCopies: 1,
+      autoPrint: true,
+      silentPrint: false,
+    },
+  },
+  {
+    id: 'a4-laser',
+    name: 'A4 Laser / Inkjet Printer',
+    description: '210mm paper · 14px font · 15mm margin · 1 copy · auto-print off',
+    values: {
+      paperWidth: 210,
+      printFontSize: 14,
+      printMargin: 15,
+      billCopies: 1,
+      autoPrint: false,
+      silentPrint: false,
+    },
+  },
+]
 
 export default function SettingsPage() {
   const { currentShop } = useSession()
@@ -55,6 +143,7 @@ export default function SettingsPage() {
     billHeaderAlign: 'center',
     billExtraNote: '',
     billAccentColor: '#f97316',
+    billBoldFont: false,
     // KOT style
     kotShowLogo: true,
     kotShowWaiter: true,
@@ -65,12 +154,22 @@ export default function SettingsPage() {
     kotHeaderAlign: 'center',
     kotAccentColor: '#f97316',
     kotExtraNote: '',
+    kotBoldFont: false,
     // Zomato API
     zomatoEnabled: false,
     zomatoApiKey: '',
     zomatoRestaurantId: '',
     zomatoApiBaseUrl: 'https://www.zomato.com/partners/v1',
     zomatoWebhookSecret: '',
+    // Printer setup
+    paperWidth: 80,
+    printFontSize: 11,
+    printMargin: 4,
+    autoPrint: true,
+    billCopies: 1,
+    silentPrint: false,
+    printHeaderText: '',
+    printFooterText: '',
   })
 
   useEffect(() => {
@@ -103,6 +202,7 @@ export default function SettingsPage() {
         billHeaderAlign: data.settings.billHeaderAlign || 'center',
         billExtraNote: data.settings.billExtraNote || '',
         billAccentColor: data.settings.billAccentColor || '#f97316',
+        billBoldFont: data.settings.billBoldFont ?? false,
         kotShowLogo: data.settings.kotShowLogo ?? true,
         kotShowWaiter: data.settings.kotShowWaiter ?? true,
         kotShowDateTime: data.settings.kotShowDateTime ?? true,
@@ -112,11 +212,20 @@ export default function SettingsPage() {
         kotHeaderAlign: data.settings.kotHeaderAlign || 'center',
         kotAccentColor: data.settings.kotAccentColor || '#f97316',
         kotExtraNote: data.settings.kotExtraNote || '',
+        kotBoldFont: data.settings.kotBoldFont ?? false,
         zomatoEnabled: data.settings.zomatoEnabled ?? false,
         zomatoApiKey: data.settings.zomatoApiKey || '',
         zomatoRestaurantId: data.settings.zomatoRestaurantId || '',
         zomatoApiBaseUrl: data.settings.zomatoApiBaseUrl || 'https://www.zomato.com/partners/v1',
         zomatoWebhookSecret: data.settings.zomatoWebhookSecret || '',
+        paperWidth: data.settings.paperWidth ?? 80,
+        printFontSize: data.settings.printFontSize ?? 11,
+        printMargin: data.settings.printMargin ?? 4,
+        autoPrint: data.settings.autoPrint ?? true,
+        billCopies: data.settings.billCopies ?? 1,
+        silentPrint: data.settings.silentPrint ?? false,
+        printHeaderText: data.settings.printHeaderText || '',
+        printFooterText: data.settings.printFooterText || '',
       })
       setLoading(false)
     }
@@ -187,9 +296,9 @@ export default function SettingsPage() {
         </CardContent>
       </Card>
 
-      {/* Tabs: Shop / Bill Style / KOT Style */}
+      {/* Tabs: Shop / Bill Style / KOT Style / Printer / Zomato */}
       <Tabs defaultValue="shop" className="w-full">
-        <TabsList className="grid w-full grid-cols-4">
+        <TabsList className="grid w-full grid-cols-5">
           <TabsTrigger value="shop" className="text-xs sm:text-sm">
             <Store className="w-3.5 h-3.5 mr-1.5" /> Shop
           </TabsTrigger>
@@ -198,6 +307,9 @@ export default function SettingsPage() {
           </TabsTrigger>
           <TabsTrigger value="kot" className="text-xs sm:text-sm">
             <ChefHat className="w-3.5 h-3.5 mr-1.5" /> KOT
+          </TabsTrigger>
+          <TabsTrigger value="printer" className="text-xs sm:text-sm">
+            <Printer className="w-3.5 h-3.5 mr-1.5" /> Printer
           </TabsTrigger>
           <TabsTrigger value="zomato" className="text-xs sm:text-sm">
             <Bike className="w-3.5 h-3.5 mr-1.5" /> Zomato
@@ -313,6 +425,21 @@ export default function SettingsPage() {
                   />
                 </div>
 
+                {/* Bold font toggle — makes ALL text on the receipt bold */}
+                <div className="flex items-center justify-between py-2 px-3 rounded-lg bg-slate-50 border border-slate-200">
+                  <div>
+                    <Label className="text-xs font-semibold cursor-pointer">Bold Font</Label>
+                    <p className="text-[10px] text-slate-500">Make all bill text bold for better readability on thermal printers</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setF({ ...f, billBoldFont: !f.billBoldFont })}
+                    className={`relative w-11 h-6 rounded-full transition-colors ${f.billBoldFont ? 'bg-orange-500' : 'bg-slate-300'}`}
+                  >
+                    <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow-sm transition-transform ${f.billBoldFont ? 'translate-x-5' : ''}`} />
+                  </button>
+                </div>
+
                 {/* Header alignment */}
                 <div className="space-y-1.5">
                   <Label className="text-xs">Header Alignment</Label>
@@ -419,6 +546,21 @@ export default function SettingsPage() {
                   />
                 </div>
 
+                {/* Bold font toggle for KOT */}
+                <div className="flex items-center justify-between py-2 px-3 rounded-lg bg-slate-50 border border-slate-200">
+                  <div>
+                    <Label className="text-xs font-semibold cursor-pointer">Bold Font</Label>
+                    <p className="text-[10px] text-slate-500">Make all KOT text bold</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setF({ ...f, kotBoldFont: !f.kotBoldFont })}
+                    className={`relative w-11 h-6 rounded-full transition-colors ${f.kotBoldFont ? 'bg-orange-500' : 'bg-slate-300'}`}
+                  >
+                    <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow-sm transition-transform ${f.kotBoldFont ? 'translate-x-5' : ''}`} />
+                  </button>
+                </div>
+
                 <div className="space-y-1.5">
                   <Label className="text-xs">Header Alignment</Label>
                   <div className="grid grid-cols-3 gap-1">
@@ -480,6 +622,182 @@ export default function SettingsPage() {
               </CardHeader>
               <CardContent className="px-5 pb-5">
                 <KotReceiptPreview settings={f} />
+              </CardContent>
+            </Card>
+          </div>
+        </TabsContent>
+
+        {/* Printer setup tab */}
+        <TabsContent value="printer" className="mt-4">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {/* Printer presets */}
+            <Card className="border-0 shadow-md rounded-2xl">
+              <CardHeader className="pb-3 px-5 pt-5">
+                <div className="flex items-center gap-2">
+                  <div className="p-1.5 rounded-lg bg-violet-50">
+                    <Zap className="w-4 h-4 text-violet-600" />
+                  </div>
+                  <CardTitle className="text-sm font-semibold text-slate-900">Printer Presets</CardTitle>
+                </div>
+              </CardHeader>
+              <CardContent className="px-5 pb-5 space-y-2">
+                <p className="text-xs text-slate-500 mb-2">
+                  Pick your thermal printer model. The right paper width, font
+                  size, and margins will be filled in automatically — you can
+                  still tweak them in the panel on the right.
+                </p>
+                {PRINTER_PRESETS.map((p) => {
+                  const isActive =
+                    f.paperWidth === p.values.paperWidth &&
+                    f.printFontSize === p.values.printFontSize &&
+                    f.printMargin === p.values.printMargin &&
+                    f.billCopies === p.values.billCopies &&
+                    f.autoPrint === p.values.autoPrint
+                  return (
+                    <button
+                      key={p.id}
+                      onClick={() => setF({ ...f, ...p.values })}
+                      className={`w-full text-left p-3 rounded-xl border-2 transition-all ${
+                        isActive
+                          ? 'border-violet-500 bg-violet-50'
+                          : 'border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-semibold text-slate-900 truncate">{p.name}</p>
+                          <p className="text-[10px] text-slate-500 mt-0.5">{p.description}</p>
+                        </div>
+                        {isActive && (
+                          <Badge className="text-[9px] bg-violet-500 text-white shrink-0">Active</Badge>
+                        )}
+                      </div>
+                    </button>
+                  )
+                })}
+
+                {/* Quick callout for the Retsol 8TUEP — most common in Indian restaurants */}
+                <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-800 space-y-1 mt-3">
+                  <p className="font-bold flex items-center gap-1">
+                    <Printer className="w-3.5 h-3.5" /> Recommended for Retsol 8TUEP
+                  </p>
+                  <p>• Paper width: <strong>80mm</strong> (thermal roll, 80×80 or 80×80×12.7)</p>
+                  <p>• Font size: <strong>11px</strong> (best legibility on 80mm)</p>
+                  <p>• Margin: <strong>4mm</strong> (matches printer's hardware margin)</p>
+                  <p>• Copies: <strong>1</strong> (single copy — Customer Copy)</p>
+                  <p>• Auto-print: <strong>ON</strong> (print dialog opens automatically)</p>
+                  <p>• Install the printer's USB driver on Windows; on Android APK the printer is auto-detected via USB-OTG.</p>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Manual printer controls */}
+            <Card className="border-0 shadow-md rounded-2xl">
+              <CardHeader className="pb-3 px-5 pt-5">
+                <div className="flex items-center gap-2">
+                  <div className="p-1.5 rounded-lg bg-slate-100">
+                    <Printer className="w-4 h-4 text-slate-700" />
+                  </div>
+                  <CardTitle className="text-sm font-semibold text-slate-900">Printer Settings</CardTitle>
+                </div>
+              </CardHeader>
+              <CardContent className="px-5 pb-5 space-y-4">
+                {/* Paper width selector */}
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Paper Width (mm)</Label>
+                  <div className="grid grid-cols-4 gap-1">
+                    {[58, 72, 80, 210].map((w) => (
+                      <button
+                        key={w}
+                        onClick={() => setF({ ...f, paperWidth: w })}
+                        className={`py-2 rounded-lg border-2 text-xs font-medium ${
+                          f.paperWidth === w ? 'border-violet-500 bg-violet-50 text-violet-700' : 'border-slate-200 text-slate-600'
+                        }`}
+                      >
+                        {w}mm
+                      </button>
+                    ))}
+                  </div>
+                  <p className="text-[10px] text-slate-400">
+                    58mm / 72mm / 80mm = thermal roll; 210mm = A4.
+                  </p>
+                </div>
+
+                {/* Font size slider */}
+                <div className="space-y-1.5">
+                  <Label className="text-xs flex items-center gap-1"><Type className="w-3 h-3" /> Print Font Size: {f.printFontSize}px</Label>
+                  <input
+                    type="range"
+                    min={9}
+                    max={16}
+                    value={f.printFontSize}
+                    onChange={(e) => setF({ ...f, printFontSize: Number(e.target.value) })}
+                    className="w-full"
+                  />
+                </div>
+
+                {/* Margin */}
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Print Margin (mm): {f.printMargin}</Label>
+                  <input
+                    type="range"
+                    min={0}
+                    max={20}
+                    value={f.printMargin}
+                    onChange={(e) => setF({ ...f, printMargin: Number(e.target.value) })}
+                    className="w-full"
+                  />
+                </div>
+
+                {/* Bill copies */}
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Number of Copies</Label>
+                  <div className="grid grid-cols-3 gap-1">
+                    {[1, 2, 3].map((c) => (
+                      <button
+                        key={c}
+                        onClick={() => setF({ ...f, billCopies: c })}
+                        className={`py-2 rounded-lg border-2 text-xs font-medium ${
+                          f.billCopies === c ? 'border-violet-500 bg-violet-50 text-violet-700' : 'border-slate-200 text-slate-600'
+                        }`}
+                      >
+                        {c} {c === 1 ? 'copy' : 'copies'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Auto-print + silent print toggles */}
+                <div className="space-y-2">
+                  <ToggleRow
+                    label="Auto-open print dialog"
+                    checked={f.autoPrint}
+                    onChange={(v) => setF({ ...f, autoPrint: v })}
+                  />
+                  <ToggleRow
+                    label="Silent print (skip preview)"
+                    checked={f.silentPrint}
+                    onChange={(v) => setF({ ...f, silentPrint: v })}
+                  />
+                </div>
+
+                {/* Optional header / footer text */}
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Print Header Text (optional)</Label>
+                  <Input
+                    value={f.printHeaderText}
+                    onChange={(e) => setF({ ...f, printHeaderText: e.target.value })}
+                    placeholder="e.g. Welcome to Spice Garden"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-xs">Print Footer Text (optional)</Label>
+                  <Input
+                    value={f.printFooterText}
+                    onChange={(e) => setF({ ...f, printFooterText: e.target.value })}
+                    placeholder="e.g. Visit again soon!"
+                  />
+                </div>
               </CardContent>
             </Card>
           </div>

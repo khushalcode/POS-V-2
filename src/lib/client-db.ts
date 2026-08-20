@@ -16,16 +16,13 @@ import { isValidKey } from '@/lib/license-keys'
 
 let db: Database | null = null
 let initialized = false
-// Cache the in-flight init promise so concurrent callers don't try to
-// initialize twice (which would re-seed the database and clobber data).
-let initPromise: Promise<Database> | null = null
-const DB_KEY = 'servingsync-database'
+const DB_KEY = 'thuso-database'
 const DB_VERSION = 1
 
 // ─── IndexedDB helpers (for persisting SQLite file) ───
 function openIDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('servingsync', DB_VERSION)
+    const req = indexedDB.open('thuso', DB_VERSION)
     req.onupgradeneeded = () => {
       req.result.createObjectStore('database')
     }
@@ -175,7 +172,7 @@ CREATE TABLE IF NOT EXISTS AppUser (
 CREATE TABLE IF NOT EXISTS ShopSetting (
   id TEXT PRIMARY KEY,
   shopId TEXT NOT NULL UNIQUE,
-  shopName TEXT NOT NULL DEFAULT 'ServingSync Restaurant',
+  shopName TEXT NOT NULL DEFAULT 'Thuso',
   address TEXT, phone TEXT, email TEXT, gstin TEXT,
   taxRate REAL NOT NULL DEFAULT 5,
   serviceRate REAL NOT NULL DEFAULT 0,
@@ -196,6 +193,7 @@ CREATE TABLE IF NOT EXISTS ShopSetting (
   billHeaderAlign TEXT NOT NULL DEFAULT 'center',
   billExtraNote TEXT,
   billAccentColor TEXT NOT NULL DEFAULT '#f97316',
+  billBoldFont INTEGER NOT NULL DEFAULT 0,
   kotShowLogo INTEGER NOT NULL DEFAULT 1,
   kotShowWaiter INTEGER NOT NULL DEFAULT 1,
   kotShowDateTime INTEGER NOT NULL DEFAULT 1,
@@ -204,12 +202,21 @@ CREATE TABLE IF NOT EXISTS ShopSetting (
   kotFontSize INTEGER NOT NULL DEFAULT 12,
   kotHeaderAlign TEXT NOT NULL DEFAULT 'center',
   kotAccentColor TEXT NOT NULL DEFAULT '#f97316',
+  kotBoldFont INTEGER NOT NULL DEFAULT 0,
   kotExtraNote TEXT,
   zomatoEnabled INTEGER NOT NULL DEFAULT 0,
   zomatoApiKey TEXT,
   zomatoRestaurantId TEXT,
   zomatoApiBaseUrl TEXT,
   zomatoWebhookSecret TEXT,
+  paperWidth INTEGER NOT NULL DEFAULT 80,
+  printFontSize INTEGER NOT NULL DEFAULT 11,
+  printMargin INTEGER NOT NULL DEFAULT 4,
+  autoPrint INTEGER NOT NULL DEFAULT 1,
+  billCopies INTEGER NOT NULL DEFAULT 1,
+  silentPrint INTEGER NOT NULL DEFAULT 0,
+  printHeaderText TEXT,
+  printFooterText TEXT,
   createdAt TEXT NOT NULL DEFAULT (datetime('now')),
   updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY (shopId) REFERENCES Shop(id) ON DELETE CASCADE
@@ -313,6 +320,55 @@ CREATE TABLE IF NOT EXISTS SyncOutbox (
   createdAt TEXT NOT NULL DEFAULT (datetime('now')),
   syncedAt TEXT
 );
+
+-- Deleted bills archive. When a bill is deleted (voided) we capture a
+-- full snapshot here BEFORE the Bill row is removed, so:
+--   • the dashboard / reports can show "Deleted Bill Amount" as its own
+--     metric and subtract it from the net cash flow
+--   • the Money Out page can list every deleted bill with reason + user
+--   • an audit trail survives even after the original Bill row is gone
+CREATE TABLE IF NOT EXISTS DeletedBill (
+  id TEXT PRIMARY KEY,
+  shopId TEXT NOT NULL,
+  originalBillId TEXT NOT NULL,
+  billNo INTEGER NOT NULL,
+  orderId TEXT NOT NULL,
+  tableNumber INTEGER NOT NULL,
+  subtotal REAL NOT NULL DEFAULT 0,
+  taxRate REAL NOT NULL DEFAULT 0,
+  taxAmount REAL NOT NULL DEFAULT 0,
+  discount REAL NOT NULL DEFAULT 0,
+  serviceCharge REAL NOT NULL DEFAULT 0,
+  total REAL NOT NULL,
+  paymentMode TEXT NOT NULL DEFAULT 'cash',
+  paymentStatus TEXT NOT NULL DEFAULT 'paid',
+  originalPaidAt TEXT NOT NULL,
+  originalCreatedAt TEXT NOT NULL,
+  reason TEXT,
+  deletedBy TEXT,
+  deletedById TEXT,
+  deletedAt TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (shopId) REFERENCES Shop(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_deletedbill_shop_deletedAt ON DeletedBill(shopId, deletedAt);
+CREATE INDEX IF NOT EXISTS idx_deletedbill_shop_originalPaidAt ON DeletedBill(shopId, originalPaidAt);
+CREATE INDEX IF NOT EXISTS idx_deletedbill_deletedById ON DeletedBill(deletedById);
+
+-- Menu categories (per-shop, user-manageable). Mirrors the Prisma model
+-- added for the server-side / Supabase migration. The client UI reads &
+-- writes through here via the use-shop-fetch shim.
+CREATE TABLE IF NOT EXISTS MenuCategory (
+  id TEXT PRIMARY KEY,
+  shopId TEXT NOT NULL,
+  name TEXT NOT NULL,
+  color TEXT NOT NULL DEFAULT 'slate',
+  sortOrder INTEGER NOT NULL DEFAULT 0,
+  createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+  updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (shopId) REFERENCES Shop(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_menucategory_shop_name ON MenuCategory(shopId, name);
+CREATE INDEX IF NOT EXISTS idx_menucategory_shop_sort ON MenuCategory(shopId, sortOrder);
 `
 
 // ─── Seed data ───
@@ -353,41 +409,36 @@ function seedDatabase(database: Database) {
   const result = database.exec('SELECT COUNT(*) as count FROM Shop')
   if (result[0]?.values[0]?.[0] > 0) return
 
-  // Seed shops
-  const shop1Id = genId()
-  const shop2Id = genId()
+  // ─── Single-shop setup ────────────────────────────────────────────────
+  // This POS is configured for ONE shop only. The shop-picker screen is
+  // skipped automatically because session.tsx auto-selects when the user
+  // has exactly one shop. If you ever need multi-shop, re-add a second
+  // INSERT here and the picker will reappear.
+  const shopId = genId()
   database.run('INSERT INTO Shop (id, name, code, color, address, phone, gstin, taxRate, currency) VALUES (?,?,?,?,?,?,?,?,?)',
-    [shop1Id, 'Spice Garden', 'SPICE', 'orange', '12 Marine Drive, Mumbai', '+91 98200 11223', '27SPICE2024G1Z9', 5, 'Rs.'])
-  database.run('INSERT INTO Shop (id, name, code, color, address, phone, gstin, taxRate, currency) VALUES (?,?,?,?,?,?,?,?,?)',
-    [shop2Id, 'Belly Bytes', 'BELLY', 'emerald', '45 Brigade Road, Bengaluru', '+91 80400 55667', '29BELLY2024G1Z2', 5, 'Rs.'])
+    [shopId, 'Spice Garden', 'SPICE', 'orange', '12 Marine Drive, Mumbai', '+91 98200 11223', '27SPICE2024G1Z9', 5, 'Rs.'])
 
-  // Seed settings
-  for (const [shopId, color] of [[shop1Id, '#f97316'], [shop2Id, '#10b981']] as [string, string][]) {
-    database.run(`INSERT INTO ShopSetting (id, shopId, shopName, billAccentColor, kotAccentColor) VALUES (?,?,?,?,?)`,
-      [genId(), shopId, shopId === shop1Id ? 'Spice Garden' : 'Belly Bytes', color, color])
-  }
+  // Seed settings for the single shop
+  database.run(`INSERT INTO ShopSetting (id, shopId, shopName, billAccentColor, kotAccentColor) VALUES (?,?,?,?,?)`,
+    [genId(), shopId, 'Spice Garden', '#f97316', '#f97316'])
 
   // Seed tables (0=Direct Counter + 1-10)
-  for (const shopId of [shop1Id, shop2Id]) {
+  database.run('INSERT INTO RestaurantTable (id, shopId, number, name, capacity, status) VALUES (?,?,?,?,?,?)',
+    [genId(), shopId, 0, 'Direct Counter', 0, 'available'])
+  for (let i = 1; i <= 10; i++) {
     database.run('INSERT INTO RestaurantTable (id, shopId, number, name, capacity, status) VALUES (?,?,?,?,?,?)',
-      [genId(), shopId, 0, 'Direct Counter', 0, 'available'])
-    for (let i = 1; i <= 10; i++) {
-      database.run('INSERT INTO RestaurantTable (id, shopId, number, name, capacity, status) VALUES (?,?,?,?,?,?)',
-        [genId(), shopId, i, `Table ${i}`, 4, 'available'])
-    }
+      [genId(), shopId, i, `Table ${i}`, 4, 'available'])
   }
 
-  // Seed menu items
-  for (const shopId of [shop1Id, shop2Id]) {
-    for (const item of MENU_ITEMS) {
-      database.run('INSERT INTO MenuItem (id, shopId, name, category, price, cost, stock, unit, available) VALUES (?,?,?,?,?,?,?,?,?)',
-        [genId(), shopId, item.name, item.category, item.price, Math.round(item.price * 0.4), 100, 'Pcs', 1])
-    }
+  // Seed menu items for the single shop
+  for (const item of MENU_ITEMS) {
+    database.run('INSERT INTO MenuItem (id, shopId, name, category, price, cost, stock, unit, available) VALUES (?,?,?,?,?,?,?,?,?)',
+      [genId(), shopId, item.name, item.category, item.price, Math.round(item.price * 0.4), 100, 'Pcs', 1])
   }
 
   // Seed super admin
   database.run('INSERT INTO AppUser (id, name, email, password, role, active) VALUES (?,?,?,?,?,?)',
-    [genId(), 'Super Admin', 'super@servingsync.com', 'admin123', 'admin', 1])
+    [genId(), 'Super Admin', 'super@thuso.com', 'admin123', 'admin', 1])
 
   // Seed license keys
   for (const key of LICENSE_KEYS) {
@@ -397,78 +448,166 @@ function seedDatabase(database: Database) {
 
 // ─── Initialize ───
 export async function initDB(): Promise<Database> {
-  // Fast path: already initialized
   if (db && initialized) return db
-  // Concurrent-call guard: if a previous initDB() is still in flight,
-  // return the same promise instead of starting a second initialization
-  // (which could otherwise re-seed the database and overwrite data).
-  if (initPromise) return initPromise
 
-  initPromise = (async () => {
-    // Load sql.js WASM. Try local bundle FIRST (works offline + in APK/EXE),
-    // fall back to CDN only if local file is missing (e.g. dev server misconfig).
-    const wasmLocators = [
-      (file: string) => `./${file}`,                          // Capacitor (capacitor://localhost/sql-wasm.wasm)
-      (file: string) => `/${file}`,                           // Web root (next.js static export)
-      (file: string) => `https://sql.js.org/dist/${file}`,    // CDN fallback (online only)
-    ]
+  // Load sql.js WASM. Try local bundle FIRST (works offline + in APK/EXE),
+  // fall back to CDN only if local file is missing (e.g. dev server misconfig).
+  const wasmLocators = [
+    (file: string) => `./${file}`,                          // Capacitor (capacitor://localhost/sql-wasm.wasm)
+    (file: string) => `/${file}`,                           // Web root (next.js static export)
+    (file: string) => `https://sql.js.org/dist/${file}`,    // CDN fallback (online only)
+  ]
 
-    let SQL: any = null
-    let lastErr: any = null
-    for (const locate of wasmLocators) {
+  let SQL: any = null
+  let lastErr: any = null
+  for (const locate of wasmLocators) {
+    try {
+      SQL = await initSqlJs({ locateFile: locate })
+      break
+    } catch (e) {
+      lastErr = e
+      // try next locator
+    }
+  }
+  if (!SQL) {
+    console.error('[client-db] All sql.js WASM loaders failed:', lastErr)
+    throw lastErr || new Error('Failed to load sql.js WASM')
+  }
+
+  // Try to load existing database from IndexedDB
+  const existingData = await loadDB()
+  if (existingData) {
+    db = new SQL.Database(existingData)
+    migrateSchema(db)
+  } else {
+    db = new SQL.Database()
+    db.run(SCHEMA_SQL)
+    seedDatabase(db)
+    await saveDB(db)
+  }
+
+  initialized = true
+  return db
+}
+
+// ─── Schema migrations (idempotent ALTER TABLE for missing columns) ───
+function migrateSchema(database: Database) {
+  const getColumns = (table: string): string[] => {
+    const result = database.exec(`PRAGMA table_info(${table})`)
+    if (!result[0]) return []
+    return result[0].values.map((row) => String(row[1]))
+  }
+  const addColumn = (table: string, column: string, defn: string) => {
+    const cols = getColumns(table)
+    if (!cols.includes(column)) {
       try {
-        SQL = await initSqlJs({ locateFile: locate })
-        break
+        database.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${defn}`)
       } catch (e) {
-        lastErr = e
-        // try next locator
+        console.warn(`[migrate] could not add ${table}.${column}:`, e)
       }
     }
-    if (!SQL) {
-      console.error('[client-db] All sql.js WASM loaders failed:', lastErr)
-      initPromise = null  // allow a future retry
-      throw lastErr || new Error('Failed to load sql.js WASM')
+  }
+  addColumn('ShopSetting', 'paperWidth', 'INTEGER NOT NULL DEFAULT 80')
+  addColumn('ShopSetting', 'printFontSize', 'INTEGER NOT NULL DEFAULT 11')
+  addColumn('ShopSetting', 'printMargin', 'INTEGER NOT NULL DEFAULT 4')
+  addColumn('ShopSetting', 'autoPrint', 'INTEGER NOT NULL DEFAULT 1')
+  addColumn('ShopSetting', 'billCopies', 'INTEGER NOT NULL DEFAULT 1')
+  addColumn('ShopSetting', 'silentPrint', 'INTEGER NOT NULL DEFAULT 0')
+  addColumn('ShopSetting', 'printHeaderText', 'TEXT')
+  addColumn('ShopSetting', 'printFooterText', 'TEXT')
+  addColumn('Orders', 'customerName', 'TEXT')
+  addColumn('Orders', 'type', "TEXT NOT NULL DEFAULT 'dine_in'")
+  addColumn('MenuItem', 'image', 'TEXT')
+  addColumn('MenuItem', 'cost', 'REAL NOT NULL DEFAULT 0')
+  addColumn('MenuItem', 'stock', 'INTEGER NOT NULL DEFAULT 0')
+  addColumn('MenuItem', 'unit', "TEXT NOT NULL DEFAULT 'Pcs'")
+  addColumn('MenuItem', 'available', 'INTEGER NOT NULL DEFAULT 1')
+  addColumn('ShopSetting', 'billBoldFont', 'INTEGER NOT NULL DEFAULT 0')
+  addColumn('ShopSetting', 'kotBoldFont', 'INTEGER NOT NULL DEFAULT 0')
+
+  // ─── Idempotent table creation for upgrades ───────────────────────────
+  // Existing user databases (in IndexedDB) won't have the DeletedBill or
+  // MenuCategory tables because they were created before these features
+  // existed. CREATE TABLE IF NOT EXISTS is safe to re-run on every boot.
+  const ensureTable = (ddl: string) => {
+    try { database.run(ddl) } catch (e) {
+      console.warn('[migrate] could not ensure table:', e)
     }
+  }
+  ensureTable(`CREATE TABLE IF NOT EXISTS DeletedBill (
+    id TEXT PRIMARY KEY,
+    shopId TEXT NOT NULL,
+    originalBillId TEXT NOT NULL,
+    billNo INTEGER NOT NULL,
+    orderId TEXT NOT NULL,
+    tableNumber INTEGER NOT NULL,
+    subtotal REAL NOT NULL DEFAULT 0,
+    taxRate REAL NOT NULL DEFAULT 0,
+    taxAmount REAL NOT NULL DEFAULT 0,
+    discount REAL NOT NULL DEFAULT 0,
+    serviceCharge REAL NOT NULL DEFAULT 0,
+    total REAL NOT NULL,
+    paymentMode TEXT NOT NULL DEFAULT 'cash',
+    paymentStatus TEXT NOT NULL DEFAULT 'paid',
+    originalPaidAt TEXT NOT NULL,
+    originalCreatedAt TEXT NOT NULL,
+    reason TEXT,
+    deletedBy TEXT,
+    deletedById TEXT,
+    deletedAt TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (shopId) REFERENCES Shop(id) ON DELETE CASCADE
+  )`)
+  ensureTable('CREATE INDEX IF NOT EXISTS idx_deletedbill_shop_deletedAt ON DeletedBill(shopId, deletedAt)')
+  ensureTable('CREATE INDEX IF NOT EXISTS idx_deletedbill_shop_originalPaidAt ON DeletedBill(shopId, originalPaidAt)')
+  ensureTable('CREATE INDEX IF NOT EXISTS idx_deletedbill_deletedById ON DeletedBill(deletedById)')
 
-    // Try to load existing database from IndexedDB
-    const existingData = await loadDB()
-    if (existingData) {
-      db = new SQL.Database(existingData)
-    } else {
-      db = new SQL.Database()
-      db.run(SCHEMA_SQL)
-      seedDatabase(db)
-      await saveDB(db)
-    }
+  ensureTable(`CREATE TABLE IF NOT EXISTS MenuCategory (
+    id TEXT PRIMARY KEY,
+    shopId TEXT NOT NULL,
+    name TEXT NOT NULL,
+    color TEXT NOT NULL DEFAULT 'slate',
+    sortOrder INTEGER NOT NULL DEFAULT 0,
+    createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+    updatedAt TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (shopId) REFERENCES Shop(id) ON DELETE CASCADE
+  )`)
+  ensureTable('CREATE UNIQUE INDEX IF NOT EXISTS idx_menucategory_shop_name ON MenuCategory(shopId, name)')
+  ensureTable('CREATE INDEX IF NOT EXISTS idx_menucategory_shop_sort ON MenuCategory(shopId, sortOrder)')
 
-    initialized = true
-    return db
-  })()
-
-  // If init fails, clear the cached promise so the next call can retry
+  // ─── Single-shop enforcement ──────────────────────────────────────────
+  // This POS is configured for ONE shop only. Existing user databases
+  // (created before this change) have 2 seeded shops ("Spice Garden" +
+  // "Belly Bytes"). We keep the first shop (alphabetically by code, which
+  // is "SPICE" → Spice Garden) and delete the rest. Cascade rules on all
+  // child tables (MenuItem, RestaurantTable, Orders, Bill, etc.) clean
+  // up the second shop's data automatically.
+  //
+  // Safe to re-run: if the shop count is already 1, this is a no-op.
   try {
-    return await initPromise
+    const shopCount = database.exec('SELECT COUNT(*) as c FROM Shop')
+    const count = shopCount[0]?.values[0]?.[0]
+    if (count && count > 1) {
+      // Keep the shop with the smallest rowid (i.e. the first one inserted,
+      // which is Spice Garden in the original seed). Delete the rest.
+      database.run(`DELETE FROM Shop WHERE id NOT IN (
+        SELECT id FROM Shop ORDER BY rowid ASC LIMIT 1
+      )`)
+      console.warn('[migrate] single-shop enforcement: removed extra shops')
+    }
   } catch (e) {
-    initPromise = null
-    throw e
+    console.warn('[migrate] single-shop enforcement failed (non-fatal):', e)
   }
 }
 
 // ─── Get DB (must call initDB first) ───
 export function getDB(): Database {
-  if (!db) {
-    throw new Error(
-      'Database not initialized. Call initDB() first.\n' +
-      'This usually means a component tried to read/write before the DB finished loading. ' +
-      'Ensure your component waits for useDbReady() before calling any client-data function.'
-    )
-  }
+  if (!db) throw new Error('Database not initialized. Call initDB() first.')
   return db
 }
 
-// ─── Check if DB is ready (non-throwing) ───
+// ─── Check if DB has been initialized (non-throwing version of getDB) ───
 export function isDbReady(): boolean {
-  return !!(db && initialized)
+  return !!db && initialized
 }
 
 // ─── Save after writes ───

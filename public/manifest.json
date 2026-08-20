@@ -1,6 +1,6 @@
 {
-  "name": "ServingSync POS",
-  "short_name": "ServingSync",
+  "name": "Thuso",
+  "short_name": "Thuso",
   "description": "Multi-shop restaurant POS with real-time KOT sync",
   "start_url": "/",
   "display": "standalone",

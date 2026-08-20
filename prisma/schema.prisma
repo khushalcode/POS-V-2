@@ -27,14 +27,32 @@ model Shop {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  menuItems    MenuItem[]
-  tables       RestaurantTable[]
-  orders       Order[]
-  bills        Bill[]
-  zomatoOrders ZomatoOrder[]
-  users        AppUser[]
-  customers    Customer[]
-  settings     ShopSetting?
+  menuItems      MenuItem[]
+  menuCategories MenuCategory[]
+  tables         RestaurantTable[]
+  orders         Order[]
+  bills          Bill[]
+  deletedBills   DeletedBill[]
+  zomatoOrders   ZomatoOrder[]
+  users          AppUser[]
+  customers      Customer[]
+  settings       ShopSetting?
+}
+
+// ---- Menu Categories (per-shop, user-manageable) ----------------------
+model MenuCategory {
+  id        String   @id @default(cuid())
+  shopId    String
+  name      String
+  color     String   @default("slate") // slate | amber | rose | orange | sky | violet | emerald
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, name])
+  @@index([shopId, sortOrder])
 }
 
 // ---- Menu ---------------------------------------------------------------
@@ -149,6 +167,50 @@ model Bill {
   @@unique([shopId, billNo])
   @@index([shopId, paidAt])
   @@index([tableNumber])
+}
+
+// ---- Deleted Bills (audit / void archive) ------------------------------
+// When a bill is deleted via DELETE /api/bills/[id], the full snapshot of
+// the bill is captured here BEFORE the bill row is removed. This:
+//   • preserves an audit trail (who deleted what, when, why, for how much)
+//   • lets the dashboard/reports subtract the deleted amount from the
+//     main revenue calculation (because the Bill row is gone, the live
+//     revenue already excludes it — but we still need to *show* the
+//     "deleted bill amount" as its own metric and include it in the
+//     Money Out page so the cash flow ties out)
+//   • powers the "Deleted Bills" section on the Money Out page
+model DeletedBill {
+  id                String   @id @default(cuid())
+  shopId            String
+  // Snapshot of the original bill — kept as plain columns (no FK) because
+  // the Bill row is deleted as part of the same operation.
+  originalBillId    String
+  billNo            Int
+  orderId           String
+  tableNumber       Int
+  subtotal          Float
+  taxRate           Float    @default(0.0)
+  taxAmount         Float    @default(0.0)
+  discount          Float    @default(0.0)
+  serviceCharge     Float    @default(0.0)
+  total             Float
+  paymentMode       String   @default("cash")
+  paymentStatus     String   @default("paid")
+  // When the bill was originally paid / created — used to attribute the
+  // deletion to the correct day in reports.
+  originalPaidAt    DateTime
+  originalCreatedAt DateTime
+  // Deletion metadata
+  reason            String?
+  deletedBy         String?  // user name at time of deletion
+  deletedById       String?  // user id at time of deletion
+  deletedAt         DateTime @default(now())
+
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([shopId, deletedAt])
+  @@index([shopId, originalPaidAt])
+  @@index([deletedById])
 }
 
 // ---- Customers ----------------------------------------------------------
@@ -293,6 +355,7 @@ model ShopSetting {
   billHeaderAlign   String   @default("center") // left | center | right
   billExtraNote     String?
   billAccentColor   String   @default("#f97316") // hex color for header accent
+  billBoldFont      Boolean  @default(false) // make all bill text bold
 
   // KOT style customization
   kotShowLogo       Boolean  @default(true)
@@ -304,6 +367,7 @@ model ShopSetting {
   kotHeaderAlign    String   @default("center")
   kotAccentColor    String   @default("#f97316")
   kotExtraNote      String?
+  kotBoldFont       Boolean  @default(false) // make all KOT text bold
 
   // Zomato Partner API integration
   zomatoEnabled    Boolean  @default(false)

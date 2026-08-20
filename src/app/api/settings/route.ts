@@ -64,6 +64,7 @@ export async function PUT(req: NextRequest) {
       ...(b.billHeaderAlign != null && { billHeaderAlign: b.billHeaderAlign }),
       ...(b.billExtraNote != null && { billExtraNote: b.billExtraNote || null }),
       ...(b.billAccentColor != null && { billAccentColor: b.billAccentColor }),
+      ...(b.billBoldFont != null && { billBoldFont: b.billBoldFont }),
       // KOT style
       ...(b.kotShowLogo != null && { kotShowLogo: b.kotShowLogo }),
       ...(b.kotShowWaiter != null && { kotShowWaiter: b.kotShowWaiter }),
@@ -74,6 +75,7 @@ export async function PUT(req: NextRequest) {
       ...(b.kotHeaderAlign != null && { kotHeaderAlign: b.kotHeaderAlign }),
       ...(b.kotAccentColor != null && { kotAccentColor: b.kotAccentColor }),
       ...(b.kotExtraNote != null && { kotExtraNote: b.kotExtraNote || null }),
+      ...(b.kotBoldFont != null && { kotBoldFont: b.kotBoldFont }),
       // Zomato API
       ...(b.zomatoEnabled != null && { zomatoEnabled: b.zomatoEnabled }),
       ...(b.zomatoApiKey !== undefined && { zomatoApiKey: b.zomatoApiKey || null }),

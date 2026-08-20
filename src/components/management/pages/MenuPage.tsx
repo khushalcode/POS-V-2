@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   Plus, Search, Edit, Trash2, Package, X, Check, Loader2, SlidersHorizontal,
+  Tags, GripVertical,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -21,8 +22,32 @@ import { formatCurrency } from '@/lib/format'
 import type { MenuItem } from '@/lib/types'
 import { useShopFetch } from '@/hooks/use-shop-fetch'
 
-const CATEGORIES = ['Starters', 'Main Course', 'Breads', 'Beverages', 'Desserts', 'General']
+// Default categories are now seeded server-side via /api/menu-categories.
+// We keep this list only as a UI fallback before the first API load completes.
+const DEFAULT_CATEGORIES = ['Starters', 'Main Course', 'Breads', 'Beverages', 'Desserts', 'General']
 const UNITS = ['Pcs', 'Plate', 'Bowl', 'Glass', 'Cup', 'Kg', 'Ltr']
+
+// Color palette for categories. Keys match what the API stores in `color`.
+const CATEGORY_COLORS: { key: string; label: string; badge: string; dot: string }[] = [
+  { key: 'slate',  label: 'Slate',  badge: 'bg-slate-100 text-slate-700 border-slate-200',  dot: 'bg-slate-400' },
+  { key: 'amber',  label: 'Amber',  badge: 'bg-amber-100 text-amber-700 border-amber-200',  dot: 'bg-amber-400' },
+  { key: 'rose',   label: 'Rose',   badge: 'bg-rose-100 text-rose-700 border-rose-200',    dot: 'bg-rose-400' },
+  { key: 'orange', label: 'Orange', badge: 'bg-orange-100 text-orange-700 border-orange-200', dot: 'bg-orange-400' },
+  { key: 'sky',    label: 'Sky',    badge: 'bg-sky-100 text-sky-700 border-sky-200',        dot: 'bg-sky-400' },
+  { key: 'violet', label: 'Violet', badge: 'bg-violet-100 text-violet-700 border-violet-200', dot: 'bg-violet-400' },
+  { key: 'emerald',label: 'Emerald',badge: 'bg-emerald-100 text-emerald-700 border-emerald-200', dot: 'bg-emerald-400' },
+]
+
+export interface MenuCategory {
+  id: string
+  name: string
+  color: string
+  sortOrder: number
+}
+
+function colorBadge(colorKey: string): string {
+  return (CATEGORY_COLORS.find((c) => c.key === colorKey) || CATEGORY_COLORS[0]).badge
+}
 
 export default function MenuPage() {
   const shopFetch = useShopFetch()
@@ -34,6 +59,8 @@ export default function MenuPage() {
   const [showAdd, setShowAdd] = useState(false)
   const [editItem, setEditItem] = useState<MenuItem | null>(null)
   const [delItem, setDelItem] = useState<MenuItem | null>(null)
+  const [categories, setCategories] = useState<MenuCategory[]>([])
+  const [showCategories, setShowCategories] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -43,7 +70,29 @@ export default function MenuPage() {
     setLoading(false)
   }, [])
 
-  useEffect(() => { load() }, [load])
+  const loadCategories = useCallback(async () => {
+    try {
+      const res = await shopFetch('/api/menu-categories')
+      if (!res.ok) {
+        console.warn('[MenuPage] loadCategories failed:', res.status)
+        return
+      }
+      const data = await res.json()
+      if (Array.isArray(data.categories)) setCategories(data.categories)
+    } catch (e) {
+      console.warn('[MenuPage] loadCategories error:', e)
+    }
+  }, [shopFetch])
+
+  useEffect(() => {
+    load()
+    loadCategories()
+  }, [load, loadCategories])
+
+  // Names available in the dropdowns. If the API hasn't loaded yet, or
+  // returns an empty list, we fall back to DEFAULT_CATEGORIES so the UI
+  // is never blank.
+  const categoryNames = categories.length > 0 ? categories.map((c) => c.name) : DEFAULT_CATEGORIES
 
   const filtered = items.filter((it) => {
     if (search && !it.name.toLowerCase().includes(search.toLowerCase())) return false
@@ -121,7 +170,7 @@ export default function MenuPage() {
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All Categories</SelectItem>
-              {CATEGORIES.map((c) => (
+              {categoryNames.map((c) => (
                 <SelectItem key={c} value={c}>{c}</SelectItem>
               ))}
             </SelectContent>
@@ -137,11 +186,66 @@ export default function MenuPage() {
               <SelectItem value="out">Out of Stock</SelectItem>
             </SelectContent>
           </Select>
+          <Button
+            variant="outline"
+            onClick={() => setShowCategories(true)}
+            className="h-9 text-xs"
+            title="Add, rename, or remove menu categories"
+          >
+            <Tags className="w-4 h-4 mr-1" /> Categories
+          </Button>
           <Button onClick={() => setShowAdd(true)} className="bg-gradient-to-r from-orange-500 to-rose-500 hover:from-orange-600 hover:to-rose-600 text-white">
             <Plus className="w-4 h-4 mr-1" /> Add Item
           </Button>
         </div>
       </div>
+
+      {/* ─── Quick-access category chips bar ───────────────────────────
+          Horizontal scrollable row of category buttons for instant
+          filtering. Click a chip to filter items by that category.
+          Click "All" to show everything. The active chip is highlighted. */}
+      {!loading && categories.length > 0 && (
+        <div className="flex items-center gap-1.5 overflow-x-auto pb-1 thin-scrollbar">
+          <button
+            onClick={() => setCategoryFilter('all')}
+            className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-semibold transition-all ${
+              categoryFilter === 'all'
+                ? 'bg-slate-900 text-white shadow-md'
+                : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
+            }`}
+          >
+            All ({items.length})
+          </button>
+          {categories.map((c) => {
+            const count = items.filter((it) => it.category === c.name).length
+            const colorMap: Record<string, string> = {
+              amber: 'bg-amber-500',
+              rose: 'bg-rose-500',
+              orange: 'bg-orange-500',
+              sky: 'bg-sky-500',
+              violet: 'bg-violet-500',
+              slate: 'bg-slate-500',
+              emerald: 'bg-emerald-500',
+            }
+            const isActive = categoryFilter === c.name
+            return (
+              <button
+                key={c.id}
+                onClick={() => setCategoryFilter(isActive ? 'all' : c.name)}
+                className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold transition-all ${
+                  isActive
+                    ? 'bg-slate-900 text-white shadow-md'
+                    : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
+                }`}
+              >
+                <span className={`w-2 h-2 rounded-full ${colorMap[c.color] || colorMap.slate}`} />
+                {c.name}
+                <span className={`text-[10px] ${isActive ? 'text-white/60' : 'text-slate-400'}`}>({count})</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
 
       {/* Items grid */}
       {loading ? (
@@ -191,7 +295,14 @@ export default function MenuPage() {
                       ) : (
                         <span className="text-3xl">{getEmoji(it.name)}</span>
                       )}
-                      <Badge className={`absolute top-1.5 right-1.5 text-[9px] px-1.5 py-0 ${catColor(it.category)}`}>
+                      <Badge className={`absolute top-1.5 right-1.5 text-[9px] px-1.5 py-0 ${
+                        // Prefer the user-picked color from the categories list; fall
+                        // back to the legacy static map so unknown categories still
+                        // render with a reasonable color.
+                        categories.find((c) => c.name === it.category)
+                          ? colorBadge(categories.find((c) => c.name === it.category)!.color)
+                          : catColor(it.category)
+                      }`}>
                         {it.category}
                       </Badge>
                       <Badge variant="outline" className={`absolute bottom-1.5 left-1.5 text-[9px] px-1 py-0 ${
@@ -201,11 +312,26 @@ export default function MenuPage() {
                       }`}>
                         {it.stock > 5 ? 'In Stock' : it.stock > 0 ? 'Low' : 'Out'}
                       </Badge>
-                      <div className="absolute top-1.5 left-1.5 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1">
-                        <Button size="icon" variant="secondary" className="h-6 w-6 bg-white/90 backdrop-blur" onClick={() => setEditItem(it)}>
+                      {/* Edit & Delete — always visible (no longer hover-only).
+                          A semi-transparent white backdrop keeps them legible
+                          regardless of the underlying image/emoji. */}
+                      <div className="absolute top-1.5 left-1.5 flex gap-1">
+                        <Button
+                          size="icon"
+                          variant="secondary"
+                          className="h-6 w-6 bg-white/90 backdrop-blur shadow-sm hover:bg-white"
+                          title="Edit item"
+                          onClick={() => setEditItem(it)}
+                        >
                           <Edit className="w-3 h-3" />
                         </Button>
-                        <Button size="icon" variant="secondary" className="h-6 w-6 bg-white/90 backdrop-blur text-rose-500" onClick={() => setDelItem(it)}>
+                        <Button
+                          size="icon"
+                          variant="secondary"
+                          className="h-6 w-6 bg-white/90 backdrop-blur shadow-sm hover:bg-white text-rose-500 hover:text-rose-600"
+                          title="Delete item"
+                          onClick={() => setDelItem(it)}
+                        >
                           <Trash2 className="w-3 h-3" />
                         </Button>
                       </div>
@@ -236,6 +362,7 @@ export default function MenuPage() {
           </DialogHeader>
           <ItemForm
             initial={editItem}
+            categories={categoryNames}
             onSubmit={editItem ? handleUpdate : handleCreate}
             onCancel={() => { setShowAdd(false); setEditItem(null) }}
           />
@@ -259,16 +386,28 @@ export default function MenuPage() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Manage categories dialog */}
+      <CategoriesManager
+        open={showCategories}
+        onClose={() => setShowCategories(false)}
+        categories={categories}
+        onChange={loadCategories}
+        onItemsChanged={load}
+        shopFetch={shopFetch}
+      />
     </div>
   )
 }
 
 function ItemForm({
   initial,
+  categories,
   onSubmit,
   onCancel,
 }: {
   initial: MenuItem | null
+  categories: string[]
   onSubmit: (data: any) => Promise<void>
   onCancel: () => void
 }) {
@@ -386,7 +525,11 @@ function ItemForm({
           <Select value={f.category} onValueChange={(v) => setF({ ...f, category: v })}>
             <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
             <SelectContent>
-              {CATEGORIES.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+              {/* Use the dynamic category list; if it's empty for any reason
+                  fall back to a single General option so the dropdown isn't empty. */}
+              {(categories.length > 0 ? categories : ['General']).map((c) => (
+                <SelectItem key={c} value={c}>{c}</SelectItem>
+              ))}
             </SelectContent>
           </Select>
         </div>
@@ -462,4 +605,331 @@ function catColor(cat: string): string {
     General: 'bg-slate-100 text-slate-700 border-slate-200',
   }
   return map[cat] || map.General
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CategoriesManager — modal dialog for adding / renaming / deleting menu
+// categories. Talks to /api/menu-categories. When a category is renamed or
+// deleted the parent refreshes the items list too (because menu items
+// reference the category name as a plain string).
+// ─────────────────────────────────────────────────────────────────────────
+function CategoriesManager({
+  open,
+  onClose,
+  categories,
+  onChange,
+  onItemsChanged,
+  shopFetch,
+}: {
+  open: boolean
+  onClose: () => void
+  categories: MenuCategory[]
+  onChange: () => Promise<void> | void
+  onItemsChanged: () => Promise<void> | void
+  shopFetch: (url: string, init?: RequestInit) => Promise<Response>
+}) {
+  const [newName, setNewName] = useState('')
+  const [newColor, setNewColor] = useState('slate')
+  const [busy, setBusy] = useState(false)
+  // editingId / editingName hold the category currently being renamed inline.
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editingName, setEditingName] = useState('')
+  const [delConfirm, setDelConfirm] = useState<MenuCategory | null>(null)
+
+  // Reset the "add new" form whenever the dialog is opened.
+  useEffect(() => {
+    if (open) {
+      setNewName('')
+      setNewColor('slate')
+      setEditingId(null)
+      setDelConfirm(null)
+    }
+  }, [open])
+
+  const handleAdd = async () => {
+    const name = newName.trim()
+    if (!name) {
+      toast.error('Enter a category name')
+      return
+    }
+    setBusy(true)
+    try {
+      const res = await shopFetch('/api/menu-categories', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, color: newColor }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        toast.error(data?.error || 'Failed to add category')
+        return
+      }
+      toast.success(`Category "${name}" added`)
+      setNewName('')
+      setNewColor('slate')
+      await onChange()
+    } catch (e) {
+      toast.error('Failed to add category')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleRenameSave = async (cat: MenuCategory) => {
+    const name = editingName.trim()
+    if (!name || name === cat.name) {
+      setEditingId(null)
+      return
+    }
+    setBusy(true)
+    try {
+      const res = await shopFetch(`/api/menu-categories/${cat.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        toast.error(data?.error || 'Failed to rename')
+        return
+      }
+      toast.success('Category renamed')
+      setEditingId(null)
+      // Renaming changes the `category` string on MenuItem rows, so refresh items too.
+      await Promise.all([onChange(), onItemsChanged()])
+    } catch {
+      toast.error('Failed to rename')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleColorChange = async (cat: MenuCategory, color: string) => {
+    setBusy(true)
+    try {
+      const res = await shopFetch(`/api/menu-categories/${cat.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ color }),
+      })
+      if (!res.ok) {
+        toast.error('Failed to update color')
+        return
+      }
+      await onChange()
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleDelete = async () => {
+    if (!delConfirm) return
+    setBusy(true)
+    try {
+      const res = await shopFetch(`/api/menu-categories/${delConfirm.id}`, { method: 'DELETE' })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        toast.error(data?.error || 'Failed to delete')
+        return
+      }
+      toast.success(`Deleted "${delConfirm.name}" — items moved to "General"`)
+      setDelConfirm(null)
+      // Deleting reassigns items to "General", so refresh items too.
+      await Promise.all([onChange(), onItemsChanged()])
+    } catch {
+      toast.error('Failed to delete')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <>
+      <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Manage Categories</DialogTitle>
+          </DialogHeader>
+
+          {/* Add new */}
+          <div className="space-y-2">
+            <Label className="text-xs">Add a new category</Label>
+            <div className="flex gap-2">
+              <Input
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                placeholder="e.g. Soups, Sides, Combo…"
+                className="flex-1 h-9"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !busy) handleAdd()
+                }}
+              />
+              <Select value={newColor} onValueChange={setNewColor}>
+                <SelectTrigger className="w-32 h-9">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {CATEGORY_COLORS.map((c) => (
+                    <SelectItem key={c.key} value={c.key}>
+                      <span className="flex items-center gap-1.5">
+                        <span className={`w-2.5 h-2.5 rounded-full ${c.dot}`} />
+                        {c.label}
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                onClick={handleAdd}
+                disabled={busy || !newName.trim()}
+                className="h-9 bg-gradient-to-r from-orange-500 to-rose-500 text-white"
+              >
+                <Plus className="w-4 h-4" />
+              </Button>
+            </div>
+          </div>
+
+          {/* Existing list */}
+          <div className="border-t border-slate-200 pt-3">
+            <Label className="text-xs text-slate-500">
+              {categories.length} categor{categories.length === 1 ? 'y' : 'ies'}
+            </Label>
+            <div className="mt-2 space-y-1.5 max-h-72 overflow-y-auto pr-1">
+              {categories.length === 0 && (
+                <p className="text-xs text-slate-400 text-center py-6">
+                  No categories yet. Add one above.
+                </p>
+              )}
+              {categories.map((cat) => (
+                <div
+                  key={cat.id}
+                  className="flex items-center gap-2 px-2 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50"
+                >
+                  {/* Color picker popover — quick inline */}
+                  <Select
+                    value={cat.color}
+                    onValueChange={(v) => handleColorChange(cat, v)}
+                    disabled={busy}
+                  >
+                    <SelectTrigger className="w-7 h-7 p-0 border-0 bg-transparent shadow-none">
+                      <span className={`w-4 h-4 rounded-full ${
+                        (CATEGORY_COLORS.find((c) => c.key === cat.color) || CATEGORY_COLORS[0]).dot
+                      }`} />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {CATEGORY_COLORS.map((c) => (
+                        <SelectItem key={c.key} value={c.key}>
+                          <span className="flex items-center gap-1.5">
+                            <span className={`w-2.5 h-2.5 rounded-full ${c.dot}`} />
+                            {c.label}
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+
+                  {editingId === cat.id ? (
+                    <Input
+                      value={editingName}
+                      onChange={(e) => setEditingName(e.target.value)}
+                      className="flex-1 h-7 text-sm"
+                      autoFocus
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !busy) handleRenameSave(cat)
+                        if (e.key === 'Escape') setEditingId(null)
+                      }}
+                    />
+                  ) : (
+                    <span className="flex-1 text-sm text-slate-800">{cat.name}</span>
+                  )}
+
+                  {editingId === cat.id ? (
+                    <div className="flex gap-1">
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-7 w-7 text-emerald-600"
+                        onClick={() => handleRenameSave(cat)}
+                        disabled={busy}
+                        title="Save"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-7 w-7"
+                        onClick={() => setEditingId(null)}
+                        disabled={busy}
+                        title="Cancel"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="flex gap-1">
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-7 w-7"
+                        onClick={() => {
+                          setEditingId(cat.id)
+                          setEditingName(cat.name)
+                        }}
+                        disabled={busy}
+                        title="Rename"
+                      >
+                        <Edit className="w-3.5 h-3.5" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="h-7 w-7 text-rose-500 hover:text-rose-600"
+                        onClick={() => setDelConfirm(cat)}
+                        disabled={busy}
+                        title="Delete"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+            <p className="text-[10px] text-slate-400 mt-2">
+              Deleting a category moves its menu items into <strong>General</strong>.
+              Renaming a category updates all items that use it.
+            </p>
+          </div>
+
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button onClick={onClose}>Done</Button>
+            </DialogClose>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete confirm */}
+      <Dialog open={!!delConfirm} onOpenChange={(o) => !o && setDelConfirm(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete category</DialogTitle>
+          </DialogHeader>
+          <p className="text-sm text-slate-600">
+            Delete <strong>{delConfirm?.name}</strong>? All menu items in this category
+            will be moved to <strong>General</strong>.
+          </p>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline">Cancel</Button>
+            </DialogClose>
+            <Button variant="destructive" onClick={handleDelete} disabled={busy}>
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
 }

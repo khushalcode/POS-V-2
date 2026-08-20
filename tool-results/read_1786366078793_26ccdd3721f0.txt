@@ -1,0 +1,865 @@
+     1→'use client'
+     2→
+     3→import { query, queryOne, execute, genId, initDB } from './client-db'
+     4→import { isValidKey } from './license-keys'
+     5→import { trackUpsert, trackDelete } from './offline-sync'
+     6→
+     7→/**
+     8→ * Client-side data access layer
+     9→ * Replaces ALL server-side API routes with direct SQLite queries.
+    10→ * No server needed — works in APK, EXE, and browser.
+    11→ *
+    12→ * Every mutating call (create/update/delete) calls trackUpsert /
+    13→ * trackDelete from offline-sync.ts so the change is queued in
+    14→ * SyncOutbox and pushed to Supabase when online. This makes the app
+    15→ * offline-first: data is never lost even if the device drops offline.
+    16→ */
+    17→
+    18→// ═══════════════════════════════════════
+    19→//  AUTH
+    20→// ═══════════════════════════════════════
+    21→export const auth = {
+    22→  login(email: string, password: string) {
+    23→    const user = queryOne<any>(
+    24→      'SELECT * FROM AppUser WHERE email = ? AND password = ? AND active = 1',
+    25→      [email.toLowerCase().trim(), password]
+    26→    )
+    27→    if (!user) return null
+    28→    const shops = user.shopId
+    29→      ? query('SELECT * FROM Shop WHERE id = ?', [user.shopId])
+    30→      : query('SELECT * FROM Shop WHERE active = 1 ORDER BY name')
+    31→    return {
+    32→      user: { id: user.id, name: user.name, email: user.email, role: user.role, shopId: user.shopId },
+    33→      shops: shops.map(convertShop),
+    34→    }
+    35→  },
+    36→}
+    37→
+    38→// ═══════════════════════════════════════
+    39→//  LICENSE
+    40→// ═══════════════════════════════════════
+    41→export const license = {
+    42→  /**
+    43→   * Validate a license key. Uses the HARDCODED list FIRST (no DB needed),
+    44→   * so validation works even if the SQLite WASM failed to load (e.g. on a
+    45→   * fresh APK install before the DB has been initialized).
+    46→   */
+    47→  validate(key: string) {
+    48→    const normalized = key.trim().toUpperCase()
+    49→    const result = isValidKey(normalized)
+    50→    if (!result.valid) return { valid: false, reason: result.reason }
+    51→
+    52→    // Hardcoded key is valid — but check DB for activation status IF DB is ready.
+    53→    // If DB isn't initialized yet, just return valid (the activate() flow will
+    54→    // initialize the DB and store the activation).
+    55→    try {
+    56→      const activation = queryOne<any>('SELECT * FROM LicenseActivation WHERE key = ?', [normalized])
+    57→      if (activation) {
+    58→        const now = new Date()
+    59→        const expiry = new Date(activation.expiresAt)
+    60→        if (expiry > now) {
+    61→          const daysLeft = Math.ceil((expiry.getTime() - now.getTime()) / (1000 * 60 * 60 * 24))
+    62→          return { valid: true, duration: result.duration, alreadyActivated: true, daysLeft }
+    63→        }
+    64→        return { valid: false, reason: 'expired' }
+    65→      }
+    66→      // Check if marked as used
+    67→      const dbKey = queryOne<any>('SELECT * FROM LicenseKey WHERE key = ?', [normalized])
+    68→      if (dbKey?.used) return { valid: false, reason: 'already_used' }
+    69→    } catch (e) {
+    70→      // DB not initialized yet — that's OK, the key is still valid per the hardcoded list.
+    71→      // The activate() call will initialize the DB.
+    72→      console.warn('[license.validate] DB not ready, using hardcoded validation only:', e)
+    73→    }
+    74→    return { valid: true, duration: result.duration }
+    75→  },
+    76→
+    77→  /**
+    78→   * Activate a license key. Initializes the DB if needed (async).
+    79→   * Returns { active, activatedAt, expiresAt, daysLeft } on success,
+    80→   * or { error } on failure.
+    81→   */
+    82→  async activate(key: string) {
+    83→    const normalized = key.trim().toUpperCase()
+    84→    const result = isValidKey(normalized)
+    85→    if (!result.valid) return { error: 'Invalid license key' }
+    86→
+    87→    // Make sure DB is initialized before we touch it.
+    88→    try {
+    89→      await initDB()
+    90→    } catch (e) {
+    91→      console.error('[license.activate] DB init failed:', e)
+    92→      return { error: 'Failed to initialize local database. Please restart the app.' }
+    93→    }
+    94→
+    95→    // Check existing activation
+    96→    const existing = queryOne<any>('SELECT * FROM LicenseActivation WHERE key = ?', [normalized])
+    97→    if (existing) {
+    98→      const now = new Date()
+    99→      const expiry = new Date(existing.expiresAt)
+   100→      if (expiry > now) {
+   101→        return { active: true, activatedAt: existing.activatedAt, expiresAt: existing.expiresAt,
+   102→          daysLeft: Math.ceil((expiry.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)) }
+   103→      }
+   104→      return { error: 'License expired' }
+   105→    }
+   106→
+   107→    // Check if used
+   108→    const dbKey = queryOne<any>('SELECT * FROM LicenseKey WHERE key = ?', [normalized])
+   109→    if (dbKey?.used) return { error: 'This key has already been used' }
+   110→
+   111→    // Activate
+   112→    const now = new Date()
+   113→    const expiresAt = new Date(now)
+   114→    expiresAt.setDate(expiresAt.getDate() + result.duration)
+   115→
+   116→    if (dbKey) {
+   117→      execute('UPDATE LicenseKey SET used = 1 WHERE id = ?', [dbKey.id])
+   118→    } else {
+   119→      execute('INSERT INTO LicenseKey (id, key, duration, used) VALUES (?,?,?,?)', [genId(), normalized, result.duration, 1])
+   120→    }
+   121→    execute('INSERT INTO LicenseActivation (id, key, activatedAt, expiresAt) VALUES (?,?,?,?)',
+   122→      [genId(), normalized, now.toISOString(), expiresAt.toISOString()])
+   123→
+   124→    return { active: true, activatedAt: now.toISOString(), expiresAt: expiresAt.toISOString(), daysLeft: result.duration }
+   125→  },
+   126→
+   127→  status() {
+   128→    try {
+   129→      const activation = queryOne<any>('SELECT * FROM LicenseActivation LIMIT 1')
+   130→      if (!activation) return { active: false, reason: 'not_activated' }
+   131→      const now = new Date()
+   132→      const expiry = new Date(activation.expiresAt)
+   133→      if (expiry < now) return { active: false, reason: 'expired', expiresAt: activation.expiresAt }
+   134→      return { active: true, activatedAt: activation.activatedAt, expiresAt: activation.expiresAt,
+   135→        daysLeft: Math.ceil((expiry.getTime() - now.getTime()) / (1000 * 60 * 60 * 24)) }
+   136→    } catch {
+   137→      // DB not ready — caller should treat as not_activated
+   138→      return { active: false, reason: 'not_activated' }
+   139→    }
+   140→  },
+   141→}
+   142→
+   143→// ═══════════════════════════════════════
+   144→//  MENU
+   145→// ═══════════════════════════════════════
+   146→export const menu = {
+   147→  list(shopId: string, category?: string) {
+   148→    const sql = category
+   149→      ? 'SELECT * FROM MenuItem WHERE shopId = ? AND category = ? ORDER BY category, name'
+   150→      : 'SELECT * FROM MenuItem WHERE shopId = ? ORDER BY category, name'
+   151→    return query(sql, category ? [shopId, category] : [shopId]).map(convertMenuItem)
+   152→  },
+   153→  create(shopId: string, data: any) {
+   154→    const id = genId()
+   155→    execute(`INSERT INTO MenuItem (id, shopId, name, category, price, cost, stock, unit, image, available)
+   156→      VALUES (?,?,?,?,?,?,?,?,?,?)`, [id, shopId, data.name, data.category || 'General', Number(data.price),
+   157→      Number(data.cost || 0), Number(data.stock || 0), data.unit || 'Pcs', data.image || null, data.available !== false ? 1 : 0])
+   158→    const created = this.getById(id)
+   159→    if (created) trackUpsert('MenuItem', created)
+   160→    return created
+   161→  },
+   162→  update(id: string, data: any) {
+   163→    const sets: string[] = []
+   164→    const params: any[] = []
+   165→    if (data.name != null) { sets.push('name = ?'); params.push(data.name) }
+   166→    if (data.category != null) { sets.push('category = ?'); params.push(data.category) }
+   167→    if (data.price != null) { sets.push('price = ?'); params.push(Number(data.price)) }
+   168→    if (data.cost != null) { sets.push('cost = ?'); params.push(Number(data.cost)) }
+   169→    if (data.stock != null) { sets.push('stock = ?'); params.push(Number(data.stock)) }
+   170→    if (data.unit != null) { sets.push('unit = ?'); params.push(data.unit) }
+   171→    if (data.image !== undefined) { sets.push('image = ?'); params.push(data.image) }
+   172→    if (data.available != null) { sets.push('available = ?'); params.push(data.available ? 1 : 0) }
+   173→    if (sets.length === 0) return null
+   174→    params.push(id)
+   175→    execute(`UPDATE MenuItem SET ${sets.join(', ')} WHERE id = ?`, params)
+   176→    const updated = this.getById(id)
+   177→    if (updated) trackUpsert('MenuItem', updated)
+   178→    return updated
+   179→  },
+   180→  getById(id: string) { return convertMenuItem(queryOne('SELECT * FROM MenuItem WHERE id = ?', [id])) },
+   181→  delete(id: string) { execute('DELETE FROM MenuItem WHERE id = ?', [id]); trackDelete('MenuItem', id) },
+   182→}
+   183→
+   184→// ═══════════════════════════════════════
+   185→//  TABLES
+   186→// ═══════════════════════════════════════
+   187→export const tables = {
+   188→  list(shopId: string) {
+   189→    const t = query('SELECT * FROM RestaurantTable WHERE shopId = ? ORDER BY number', [shopId])
+   190→    return t.map((row: any) => {
+   191→      const table = convertTable(row)
+   192→      if (row.currentOrderId) {
+   193→        const order = orders.getById(row.currentOrderId)
+   194→        table.currentOrder = order
+   195→      }
+   196→      return table
+   197→    })
+   198→  },
+   199→  seed(shopId: string) {
+   200→    const count = queryOne<any>('SELECT COUNT(*) as c FROM RestaurantTable WHERE shopId = ?', [shopId])
+   201→    if (count?.c > 0) return { seeded: false }
+   202→    const seededIds: string[] = []
+   203→    const directId = genId()
+   204→    execute('INSERT INTO RestaurantTable (id, shopId, number, name, capacity, status) VALUES (?,?,?,?,?,?)', [directId, shopId, 0, 'Direct Counter', 0, 'available'])
+   205→    seededIds.push(directId)
+   206→    for (let i = 1; i <= 10; i++) {
+   207→      const tid = genId()
+   208→      execute('INSERT INTO RestaurantTable (id, shopId, number, name, capacity, status) VALUES (?,?,?,?,?,?)', [tid, shopId, i, `Table ${i}`, 4, 'available'])
+   209→      seededIds.push(tid)
+   210→    }
+   211→    // Sync seeded tables to Supabase
+   212→    for (const tid of seededIds) {
+   213→      const t = queryOne<any>('SELECT * FROM RestaurantTable WHERE id = ?', [tid])
+   214→      if (t) trackUpsert('RestaurantTable', convertTable(t))
+   215→    }
+   216→    return { seeded: true }
+   217→  },
+   218→  update(id: string, data: any) {
+   219→    const sets: string[] = []; const params: any[] = []
+   220→    if (data.status != null) { sets.push('status = ?'); params.push(data.status) }
+   221→    if (data.currentOrderId !== undefined) { sets.push('currentOrderId = ?'); params.push(data.currentOrderId || null) }
+   222→    if (sets.length === 0) return null
+   223→    params.push(id)
+   224→    execute(`UPDATE RestaurantTable SET ${sets.join(', ')} WHERE id = ?`, params)
+   225→    const t = queryOne<any>('SELECT * FROM RestaurantTable WHERE id = ?', [id])
+   226→    if (t) trackUpsert('RestaurantTable', convertTable(t))
+   227→    return t ? convertTable(t) : null
+   228→  },
+   229→}
+   230→
+   231→// ═══════════════════════════════════════
+   232→//  ORDERS
+   233→// ═══════════════════════════════════════
+   234→export const orders = {
+   235→  list(shopId: string, status?: string) {
+   236→    const sql = status
+   237→      ? 'SELECT * FROM Orders WHERE shopId = ? AND status = ? ORDER BY createdAt DESC'
+   238→      : 'SELECT * FROM Orders WHERE shopId = ? ORDER BY createdAt DESC'
+   239→    const rows = query(sql, status ? [shopId, status] : [shopId])
+   240→    return rows.map((row: any) => {
+   241→      const order = convertOrder(row)
+   242→      order.items = query('SELECT * FROM OrderItem WHERE orderId = ?', [row.id]).map(convertOrderItem)
+   243→      const table = queryOne<any>('SELECT * FROM RestaurantTable WHERE id = ?', [row.tableId])
+   244→      order.table = table ? convertTable(table) : null
+   245→      return order
+   246→    })
+   247→  },
+   248→  getById(id: string) {
+   249→    const row = queryOne<any>('SELECT * FROM Orders WHERE id = ?', [id])
+   250→    if (!row) return null
+   251→    const order = convertOrder(row)
+   252→    order.items = query('SELECT * FROM OrderItem WHERE orderId = ?', [id]).map(convertOrderItem)
+   253→    const table = queryOne<any>('SELECT * FROM RestaurantTable WHERE id = ?', [row.tableId])
+   254→    order.table = table ? convertTable(table) : null
+   255→    return order
+   256→  },
+   257→  create(shopId: string, tableId: string, type: string = 'dine_in', guests: number = 1, waiterName?: string, customerName?: string, notes?: string) {
+   258→    const id = genId()
+   259→    execute(`INSERT INTO Orders (id, shopId, tableId, status, type, guests, waiterName, customerName, notes)
+   260→      VALUES (?,?,?,?,?,?,?,?,?)`, [id, shopId, tableId, 'open', type, guests, waiterName || null, customerName || null, notes || null])
+   261→    execute('UPDATE RestaurantTable SET status = ?, currentOrderId = ? WHERE id = ?', ['occupied', id, tableId])
+   262→    const created = this.getById(id)
+   263→    if (created) trackUpsert('Orders', created)
+   264→    // The table's status changed too — sync that.
+   265→    const t = queryOne<any>('SELECT * FROM RestaurantTable WHERE id = ?', [tableId])
+   266→    if (t) trackUpsert('RestaurantTable', convertTable(t))
+   267→    return created
+   268→  },
+   269→  delete(id: string) {
+   270→    // Capture tableId before deleting so we can sync the freed table.
+   271→    const order = this.getById(id)
+   272→    execute('DELETE FROM OrderItem WHERE orderId = ?', [id])
+   273→    execute('DELETE FROM Bill WHERE orderId = ?', [id])
+   274→    execute('DELETE FROM Orders WHERE id = ?', [id])
+   275→    execute('UPDATE RestaurantTable SET status = ?, currentOrderId = NULL WHERE currentOrderId = ?', ['available', id])
+   276→    trackDelete('Orders', id)
+   277→    if (order?.tableId) {
+   278→      const t = queryOne<any>('SELECT * FROM RestaurantTable WHERE id = ?', [order.tableId])
+   279→      if (t) trackUpsert('RestaurantTable', convertTable(t))
+   280→    }
+   281→  },
+   282→  sendKOT(id: string) {
+   283→    execute('UPDATE Orders SET status = ?, kotPrinted = 1 WHERE id = ?', ['sent', id])
+   284→    const updated = this.getById(id)
+   285→    if (updated) trackUpsert('Orders', updated)
+   286→    return updated
+   287→  },
+   288→  updateStatus(id: string, status: string) {
+   289→    execute('UPDATE Orders SET status = ? WHERE id = ?', [status, id])
+   290→    const updated = this.getById(id)
+   291→    if (updated) trackUpsert('Orders', updated)
+   292→    return updated
+   293→  },
+   294→  freeTable(id: string) {
+   295→    const order = this.getById(id)
+   296→    if (!order) return
+   297→    execute('UPDATE Orders SET status = ? WHERE id = ?', ['billed', id])
+   298→    execute('UPDATE RestaurantTable SET status = ?, currentOrderId = NULL WHERE id = ?', ['available', order.tableId])
+   299→    const updated = this.getById(id)
+   300→    if (updated) trackUpsert('Orders', updated)
+   301→    const t = queryOne<any>('SELECT * FROM RestaurantTable WHERE id = ?', [order.tableId])
+   302→    if (t) trackUpsert('RestaurantTable', convertTable(t))
+   303→    return order.table?.number
+   304→  },
+   305→  // ─── Order Items ───
+   306→  addItem(orderId: string, menuItemId: string, name: string, price: number, quantity: number, notes?: string) {
+   307→    // Check if there's an existing pending item with same menu item
+   308→    const existing = queryOne<any>('SELECT * FROM OrderItem WHERE orderId = ? AND menuItemId = ? AND status = ? AND notes IS ?',
+   309→      [orderId, menuItemId, 'pending', notes || null])
+   310→    let itemId: string
+   311→    if (existing) {
+   312→      execute('UPDATE OrderItem SET quantity = quantity + ? WHERE id = ?', [quantity, existing.id])
+   313→      itemId = existing.id
+   314→    } else {
+   315→      itemId = genId()
+   316→      execute('INSERT INTO OrderItem (id, orderId, menuItemId, name, price, quantity, status, notes) VALUES (?,?,?,?,?,?,?,?)',
+   317→        [itemId, orderId, menuItemId, name, price, quantity, 'pending', notes || null])
+   318→    }
+   319→    const item = queryOne('SELECT * FROM OrderItem WHERE id = ?', [itemId])
+   320→    if (item) trackUpsert('OrderItem', item)
+   321→    return orders.getById(orderId)
+   322→  },
+   323→  updateItem(itemId: string, data: any) {
+   324→    const sets: string[] = []
+   325→    const params: any[] = []
+   326→    if (data.status != null) { sets.push('status = ?'); params.push(data.status) }
+   327→    if (data.quantity != null) { sets.push('quantity = ?'); params.push(Number(data.quantity)) }
+   328→    if (data.notes != null) { sets.push('notes = ?'); params.push(data.notes) }
+   329→    if (sets.length === 0) return null
+   330→    params.push(itemId)
+   331→    execute(`UPDATE OrderItem SET ${sets.join(', ')} WHERE id = ?`, params)
+   332→    const updated = queryOne('SELECT * FROM OrderItem WHERE id = ?', [itemId])
+   333→    if (updated) trackUpsert('OrderItem', updated)
+   334→    return updated
+   335→  },
+   336→  deleteItem(itemId: string) { execute('DELETE FROM OrderItem WHERE id = ?', [itemId]); trackDelete('OrderItem', itemId) },
+   337→}
+   338→
+   339→// ═══════════════════════════════════════
+   340→//  BILLS
+   341→// ═══════════════════════════════════════
+   342→export const bills = {
+   343→  list(shopId: string, filters?: { from?: string; to?: string; table?: number; q?: string }) {
+   344→    let sql = 'SELECT * FROM Bill WHERE shopId = ?'
+   345→    const params: any[] = [shopId]
+   346→    if (filters?.from) { sql += ' AND paidAt >= ?'; params.push(filters.from) }
+   347→    if (filters?.to) { sql += ' AND paidAt <= ?'; params.push(filters.to) }
+   348→    if (filters?.table) { sql += ' AND tableNumber = ?'; params.push(filters.table) }
+   349→    sql += ' ORDER BY paidAt DESC'
+   350→    let result = query(sql, params)
+   351→    if (filters?.q) {
+   352→      const term = filters.q.toLowerCase()
+   353→      result = result.filter((b: any) => String(b.billNo).includes(term))
+   354→    }
+   355→    return result.map((b: any) => {
+   356→      const bill = convertBill(b)
+   357→      const order = orders.getById(b.orderId)
+   358→      bill.order = order
+   359→      return bill
+   360→    })
+   361→  },
+   362→  getById(id: string) {
+   363→    const row = queryOne<any>('SELECT * FROM Bill WHERE id = ?', [id])
+   364→    if (!row) return null
+   365→    const bill = convertBill(row)
+   366→    bill.order = orders.getById(row.orderId)
+   367→    return bill
+   368→  },
+   369→  nextNo(shopId: string) {
+   370→    const last = queryOne<any>('SELECT billNo FROM Bill WHERE shopId = ? ORDER BY billNo DESC LIMIT 1', [shopId])
+   371→    return last?.billNo ? last.billNo + 1 : 1001
+   372→  },
+   373→  create(shopId: string, orderId: string, tableNumber: number, subtotal: number, taxRate: number, taxAmount: number, discount: number, serviceCharge: number, total: number, paymentMode: string) {
+   374→    const id = genId()
+   375→    const billNo = this.nextNo(shopId)
+   376→    // ─── BUG FIX: Many callers (e.g. CounterMode.confirmBill) only pass
+   377→    // { taxRate, discount, serviceCharge, paymentMode } in the POST body —
+   378→    // they do NOT pass subtotal / taxAmount / total. The use-shop-fetch
+   379→    // shim falls back to 0 for those missing fields, which means bills were
+   380→    // being saved with subtotal=0, taxAmount=0, total=0.
+   381→    //
+   382→    // To make this bullet-proof, we ALWAYS recompute the amounts here from
+   383→    // the live order items, then fall back to the caller-supplied values
+   384→    // only if the recomputed subtotal is also 0 (defensive, shouldn't happen
+   385→    // for a real order). The caller's taxRate / discount / serviceCharge are
+   386→    // still honored.
+   387→    const order = orders.getById(orderId)
+   388→    const activeItems = (order?.items || []).filter((i: any) => i.status !== 'cancelled')
+   389→    const computedSubtotal = activeItems.reduce((s, i) => s + Number(i.price) * Number(i.quantity), 0)
+   390→    const safeSubtotal = computedSubtotal > 0 ? computedSubtotal : Number(subtotal) || 0
+   391→    const safeTaxRate = Number(taxRate) || 0
+   392→    const computedTaxAmount = Math.round(safeSubtotal * safeTaxRate) / 100
+   393→    const safeTaxAmount = computedTaxAmount || Number(taxAmount) || 0
+   394→    const safeDiscount = Number(discount) || 0
+   395→    const safeServiceCharge = Number(serviceCharge) || 0
+   396→    const computedTotal = Math.max(0, safeSubtotal + safeTaxAmount + safeServiceCharge - safeDiscount)
+   397→    const safeTotal = computedTotal > 0 ? computedTotal : Number(total) || 0
+   398→    execute(`INSERT INTO Bill (id, shopId, billNo, orderId, tableNumber, subtotal, taxRate, taxAmount, discount, serviceCharge, total, paymentMode, paymentStatus, paidAt)
+   399→      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, shopId, billNo, orderId, tableNumber, safeSubtotal, safeTaxRate, safeTaxAmount, safeDiscount, safeServiceCharge, safeTotal, paymentMode, 'paid', new Date().toISOString()])
+   400→    execute('UPDATE Orders SET status = ?, billPrinted = 1 WHERE id = ?', ['paid', orderId])
+   401→    execute('UPDATE RestaurantTable SET status = ?, currentOrderId = NULL WHERE currentOrderId = ?', ['available', orderId])
+   402→    try {
+   403→      execute(`INSERT INTO MoneyIn (id, shopId, amount, source, description, partyName, paymentMode, date)
+   404→        VALUES (?,?,?,?,?,?,?,?)`,
+   405→        [genId(), shopId, safeTotal, 'Sale', `Bill #${billNo} (Table ${tableNumber})`, null, paymentMode, new Date().toISOString()])
+   406→    } catch (e) {
+   407→      console.warn('[bills.create] MoneyIn auto-add failed:', e)
+   408→    }
+   409→    const created = this.getById(id)
+   410→    // Sync the new bill, the paid order, and any auto-added MoneyIn to Supabase.
+   411→    if (created) trackUpsert('Bill', created)
+   412→    const paidOrder = orders.getById(orderId)
+   413→    if (paidOrder) trackUpsert('Orders', paidOrder)
+   414→    return created
+   415→  },
+   416→}
+   417→
+   418→// ═══════════════════════════════════════
+   419→//  SETTINGS
+   420→// ═══════════════════════════════════════
+   421→export const settings = {
+   422→  get(shopId: string) {
+   423→    let row = queryOne<any>('SELECT * FROM ShopSetting WHERE shopId = ?', [shopId])
+   424→    if (!row) {
+   425→      const shop = queryOne<any>('SELECT * FROM Shop WHERE id = ?', [shopId])
+   426→      execute('INSERT INTO ShopSetting (id, shopId, shopName) VALUES (?,?)', [genId(), shopId, shop?.name || 'Restaurant'])
+   427→      row = queryOne<any>('SELECT * FROM ShopSetting WHERE shopId = ?', [shopId])
+   428→    }
+   429→    return convertSettings(row)
+   430→  },
+   431→  update(shopId: string, data: any) {
+   432→    let row = queryOne<any>('SELECT * FROM ShopSetting WHERE shopId = ?', [shopId])
+   433→    if (!row) { execute('INSERT INTO ShopSetting (id, shopId) VALUES (?,?)', [genId(), shopId]); row = queryOne('SELECT * FROM ShopSetting WHERE shopId = ?', [shopId]) }
+   434→    const sets: string[] = []
+   435→    const params: any[] = []
+   436→    for (const [key, value] of Object.entries(data)) {
+   437→      if (value != null) {
+   438→        sets.push(`${key} = ?`)
+   439→        params.push(typeof value === 'boolean' ? (value ? 1 : 0) : value)
+   440→      }
+   441→    }
+   442→    if (sets.length === 0) return this.get(shopId)
+   443→    params.push(shopId)
+   444→    execute(`UPDATE ShopSetting SET ${sets.join(', ')} WHERE shopId = ?`, params)
+   445→    // Note: ShopSetting is intentionally NOT synced to Supabase — settings
+   446→    // are per-device (printer config, etc.) and shouldn't clobber another
+   447→    // device's settings.
+   448→    return this.get(shopId)
+   449→  },
+   450→}
+   451→
+   452→// ═══════════════════════════════════════
+   453→//  USERS
+   454→// ═══════════════════════════════════════
+   455→export const users = {
+   456→  list() { return query('SELECT id, name, email, role, active, shopId, createdAt FROM AppUser ORDER BY createdAt DESC').map(convertUser) },
+   457→  create(data: any) {
+   458→    const id = genId()
+   459→    execute('INSERT INTO AppUser (id, name, email, password, role, active, shopId) VALUES (?,?,?,?,?,?,?)',
+   460→      [id, data.name, data.email.toLowerCase(), data.password, data.role || 'staff', data.active !== false ? 1 : 0, data.shopId || null])
+   461→    return { id, name: data.name, email: data.email, role: data.role || 'staff' }
+   462→  },
+   463→  update(id: string, data: any) {
+   464→    const sets: string[] = []; const params: any[] = []
+   465→    if (data.name != null) { sets.push('name = ?'); params.push(data.name) }
+   466→    if (data.email != null) { sets.push('email = ?'); params.push(data.email.toLowerCase()) }
+   467→    if (data.role != null) { sets.push('role = ?'); params.push(data.role) }
+   468→    if (data.active != null) { sets.push('active = ?'); params.push(data.active ? 1 : 0) }
+   469→    if (data.password) { sets.push('password = ?'); params.push(data.password) }
+   470→    if (data.shopId !== undefined) { sets.push('shopId = ?'); params.push(data.shopId || null) }
+   471→    if (sets.length === 0) return null
+   472→    params.push(id); execute(`UPDATE AppUser SET ${sets.join(', ')} WHERE id = ?`, params)
+   473→    return { id, name: data.name, email: data.email, role: data.role }
+   474→  },
+   475→  delete(id: string) { execute('DELETE FROM AppUser WHERE id = ?', [id]) },
+   476→}
+   477→
+   478→// ═══════════════════════════════════════
+   479→//  DASHBOARD
+   480→// ═══════════════════════════════════════
+   481→export const dashboard = {
+   482→  get(shopId: string) {
+   483→    const today = new Date(); today.setHours(0, 0, 0, 0)
+   484→    const monthStart = new Date(); monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0)
+   485→
+   486→    const todayBills = queryOne<any>('SELECT COUNT(*) as c, COALESCE(SUM(total), 0) as s FROM Bill WHERE shopId = ? AND paidAt >= ?', [shopId, today.toISOString()])
+   487→    const monthBills = queryOne<any>('SELECT COUNT(*) as c, COALESCE(SUM(total), 0) as s FROM Bill WHERE shopId = ? AND paidAt >= ?', [shopId, monthStart.toISOString()])
+   488→    const allBills = queryOne<any>('SELECT COUNT(*) as c, COALESCE(SUM(total), 0) as s FROM Bill WHERE shopId = ?', [shopId])
+   489→    const menuCount = queryOne<any>('SELECT COUNT(*) as c FROM MenuItem WHERE shopId = ?', [shopId])
+   490→    const customerCount = queryOne<any>('SELECT COUNT(*) as c FROM Customer WHERE shopId = ?', [shopId])
+   491→    const supplierCount = queryOne<any>('SELECT COUNT(*) as c FROM Supplier WHERE shopId = ?', [shopId])
+   492→    const occupiedTables = queryOne<any>('SELECT COUNT(*) as c FROM RestaurantTable WHERE shopId = ? AND status = ? AND number > 0', [shopId, 'occupied'])
+   493→    const totalTables = queryOne<any>('SELECT COUNT(*) as c FROM RestaurantTable WHERE shopId = ? AND number > 0', [shopId])
+   494→    const recentBills = query<any>('SELECT * FROM Bill WHERE shopId = ? ORDER BY paidAt DESC LIMIT 5', [shopId])
+   495→    const topItems = query<any>(`
+   496→      SELECT oi.name, SUM(oi.quantity) as qty, SUM(oi.quantity * oi.price) as revenue
+   497→      FROM OrderItem oi
+   498→      JOIN Orders o ON oi.orderId = o.id
+   499→      WHERE o.shopId = ? AND o.createdAt >= ?
+   500→      GROUP BY oi.name
+   501→      ORDER BY qty DESC
+   502→      LIMIT 5
+   503→    `, [shopId, new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()])
+   504→    const lowStock = query<any>('SELECT name, stock, unit FROM MenuItem WHERE shopId = ? AND stock < 10 AND stock >= 0 ORDER BY stock ASC LIMIT 5', [shopId])
+   505→    const salesInRow = queryOne<any>('SELECT COALESCE(SUM(total), 0) as s FROM Bill WHERE shopId = ? AND paidAt >= ?', [shopId, today.toISOString()])
+   506→    const otherInRow = queryOne<any>('SELECT COALESCE(SUM(amount), 0) as s FROM MoneyIn WHERE shopId = ? AND date >= ?', [shopId, today.toISOString()])
+   507→    const expensesRow = queryOne<any>('SELECT COALESCE(SUM(amount), 0) as s FROM Expense WHERE shopId = ? AND date >= ?', [shopId, today.toISOString()])
+   508→    const purchasesRow = queryOne<any>('SELECT COALESCE(SUM(total), 0) as s FROM Purchase WHERE shopId = ? AND createdAt >= ?', [shopId, today.toISOString()])
+   509→    const otherOutRow = queryOne<any>('SELECT COALESCE(SUM(amount), 0) as s FROM MoneyOut WHERE shopId = ? AND date >= ?', [shopId, today.toISOString()])
+   510→    const salesIn = salesInRow?.s || 0
+   511→    const otherIn = otherInRow?.s || 0
+   512→    const expenses = expensesRow?.s || 0
+   513→    const purchases = purchasesRow?.s || 0
+   514→    const otherOut = otherOutRow?.s || 0
+   515→    const chartData: { date: string; revenue: number }[] = []
+   516→    for (let i = 6; i >= 0; i--) {
+   517→      const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - i)
+   518→      const next = new Date(d); next.setDate(next.getDate() + 1)
+   519→      const row = queryOne<any>('SELECT COALESCE(SUM(total), 0) as s FROM Bill WHERE shopId = ? AND paidAt >= ? AND paidAt < ?', [shopId, d.toISOString(), next.toISOString()])
+   520→      chartData.push({ date: d.toISOString().slice(0, 10), revenue: row?.s || 0 })
+   521→    }
+   522→
+   523→    return {
+   524→      today: { revenue: todayBills?.s || 0, count: todayBills?.c || 0 },
+   525→      month: { revenue: monthBills?.s || 0, count: monthBills?.c || 0 },
+   526→      allTime: { revenue: allBills?.s || 0, count: allBills?.c || 0 },
+   527→      catalog: { menuItems: menuCount?.c || 0, customers: customerCount?.c || 0, suppliers: supplierCount?.c || 0 },
+   528→      tables: { occupied: occupiedTables?.c || 0, total: totalTables?.c || 0 },
+   529→      recentBills: recentBills || [],
+   530→      topItems: topItems || [],
+   531→      lowStock: lowStock || [],
+   532→      cashFlow: { salesIn, otherIn, expenses, purchases, otherOut, net: salesIn + otherIn - expenses - purchases - otherOut },
+   533→      chartData,
+   534→    }
+   535→  },
+   536→}
+   537→
+   538→// ═══════════════════════════════════════
+   539→//  ZOMATO
+   540→// ═══════════════════════════════════════
+   541→export const zomato = {
+   542→  list(shopId: string, status?: string) {
+   543→    const sql = status ? 'SELECT * FROM ZomatoOrder WHERE shopId = ? AND status = ? ORDER BY createdAt DESC' : 'SELECT * FROM ZomatoOrder WHERE shopId = ? ORDER BY createdAt DESC'
+   544→    return query(sql, status ? [shopId, status] : [shopId]).map(convertZomatoOrder)
+   545→  },
+   546→  create(shopId: string, data: any) {
+   547→    const id = genId()
+   548→    const last = queryOne<any>('SELECT zomatoOrderId FROM ZomatoOrder WHERE shopId = ? ORDER BY zomatoOrderId DESC LIMIT 1', [shopId])
+   549→    const nextNum = last ? (parseInt(last.zomatoOrderId.replace(/\D/g, '')) || 1000) + 1 : 1001
+   550→    execute(`INSERT INTO ZomatoOrder (id, shopId, zomatoOrderId, customerName, customerPhone, deliveryType, address, items, subtotal, taxAmount, packagingCharge, deliveryFee, discount, total, paymentMode, status, notes)
+   551→      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, shopId, `ZOM-${nextNum}`, data.customerName, data.customerPhone || null,
+   552→      data.deliveryType || 'delivery', data.address || null, JSON.stringify(data.items), data.subtotal, data.taxAmount || 0,
+   553→      data.packagingCharge || 0, data.deliveryFee || 0, data.discount || 0, data.total, data.paymentMode || 'prepaid', 'new', data.notes || null])
+   554→    return this.getById(id)
+   555→  },
+   556→  getById(id: string) { return convertZomatoOrder(queryOne('SELECT * FROM ZomatoOrder WHERE id = ?', [id])) },
+   557→  updateStatus(id: string, status: string) { execute('UPDATE ZomatoOrder SET status = ? WHERE id = ?', [status, id]) },
+   558→  delete(id: string) { execute('DELETE FROM ZomatoOrder WHERE id = ?', [id]) },
+   559→  pushToKitchen(shopId: string, zomatoOrderId: string) {
+   560→    const zomato = this.getById(zomatoOrderId)
+   561→    if (!zomato || zomato.internalOrderId) return null
+   562→    const items = JSON.parse(zomato.items || '[]')
+   563→    // Find Direct Counter table
+   564→    let directTable = queryOne<any>('SELECT * FROM RestaurantTable WHERE shopId = ? AND number = 0', [shopId])
+   565→    if (!directTable) {
+   566→      directTable = { id: genId() }
+   567→      execute('INSERT INTO RestaurantTable (id, shopId, number, name, capacity, status) VALUES (?,?,?,?,?,?)', [directTable.id, shopId, 0, 'Direct Counter', 0, 'available'])
+   568→    }
+   569→    const order = orders.create(shopId, directTable.id, zomato.deliveryType === 'pickup' ? 'takeaway' : 'direct', 1, undefined, zomato.customerName, `Zomato Order ${zomato.zomatoOrderId}`)
+   570→    for (const it of items) {
+   571→      const menuMatch = queryOne<any>('SELECT * FROM MenuItem WHERE shopId = ? AND name = ?', [shopId, it.name])
+   572→      let menuItemId = menuMatch?.id
+   573→      if (!menuItemId) {
+   574→        menuItemId = genId()
+   575→        execute('INSERT INTO MenuItem (id, shopId, name, category, price, cost, stock, unit, available) VALUES (?,?,?,?,?,?,?,?,?)', [menuItemId, shopId, it.name, 'General', it.price, 0, 0, 'Pcs', 1])
+   576→      }
+   577→      orders.addItem(order.id, menuItemId, it.name, it.price, it.qty)
+   578→    }
+   579→    execute('UPDATE Orders SET status = ?, kotPrinted = 1 WHERE id = ?', ['sent', order.id])
+   580→    execute('UPDATE RestaurantTable SET status = ?, currentOrderId = ? WHERE id = ?', ['occupied', order.id, directTable.id])
+   581→    execute('UPDATE ZomatoOrder SET internalOrderId = ?, status = ? WHERE id = ?', [order.id, 'accepted', zomatoOrderId])
+   582→    return order
+   583→  },
+   584→}
+   585→
+   586→// ═══════════════════════════════════════
+   587→//  AUDIT LOG
+   588→// ═══════════════════════════════════════
+   589→export const audit = {
+   590→  log(action: string, details?: any, shopId?: string, userName?: string) {
+   591→    execute('INSERT INTO AuditLog (id, shopId, userName, action, details) VALUES (?,?,?,?,?)',
+   592→      [genId(), shopId || null, userName || null, action, details ? JSON.stringify(details) : null])
+   593→  },
+   594→  list(shopId?: string, action?: string) {
+   595→    let sql = 'SELECT * FROM AuditLog'
+   596→    const params: any[] = []
+   597→    const conditions: string[] = []
+   598→    if (shopId) { conditions.push('shopId = ?'); params.push(shopId) }
+   599→    if (action) { conditions.push('action = ?'); params.push(action) }
+   600→    if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ')
+   601→    sql += ' ORDER BY createdAt DESC LIMIT 500'
+   602→    return query(sql, params)
+   603→  },
+   604→}
+   605→
+   606→// ═══════════════════════════════════════
+   607→//  SYNC OUTBOX (for Supabase KOT sync)
+   608→// ═══════════════════════════════════════
+   609→export const syncQueue = {
+   610→  add(eventType: string, payload: any) {
+   611→    execute('INSERT INTO SyncOutbox (id, eventType, payload) VALUES (?,?,?)',
+   612→      [genId(), eventType, JSON.stringify(payload)])
+   613→  },
+   614→  getPending() {
+   615→    return query('SELECT * FROM SyncOutbox WHERE status = ? ORDER BY createdAt ASC', ['pending'])
+   616→  },
+   617→  markSynced(id: string) {
+   618→    execute('UPDATE SyncOutbox SET status = ?, syncedAt = ? WHERE id = ?', ['synced', new Date().toISOString(), id])
+   619→  },
+   620→  markFailed(id: string) {
+   621→    execute('UPDATE SyncOutbox SET attempts = attempts + 1 WHERE id = ?', [id])
+   622→  },
+   623→}
+   624→
+   625→
+   626→
+   627→// ═══════════════════════════════════════
+   628→//  SHOPS
+   629→// ═══════════════════════════════════════
+   630→export const shops = {
+   631→  list() { return query('SELECT * FROM Shop ORDER BY name').map(convertShop) },
+   632→  listActive() { return query('SELECT * FROM Shop WHERE active = 1 ORDER BY name').map(convertShop) },
+   633→  getById(id: string) { return convertShop(queryOne('SELECT * FROM Shop WHERE id = ?', [id])) },
+   634→  create(data: any) {
+   635→    const id = genId()
+   636→    execute('INSERT INTO Shop (id, name, code, color, address, phone, gstin, taxRate, currency) VALUES (?,?,?,?,?,?,?,?,?)',
+   637→      [id, data.name, (data.code || data.name.substring(0, 4)).toUpperCase(), data.color || 'orange', data.address || null, data.phone || null, data.gstin || null, data.taxRate || 5, data.currency || 'Rs.'])
+   638→    const created = this.getById(id)
+   639→    if (created) trackUpsert('Shop', created)
+   640→    return created
+   641→  },
+   642→  update(id: string, data: any) {
+   643→    const sets: string[] = []; const params: any[] = []
+   644→    if (data.name) { sets.push('name = ?'); params.push(data.name) }
+   645→    if (data.code) { sets.push('code = ?'); params.push(data.code) }
+   646→    if (data.color) { sets.push('color = ?'); params.push(data.color) }
+   647→    if (data.address !== undefined) { sets.push('address = ?'); params.push(data.address) }
+   648→    if (data.phone !== undefined) { sets.push('phone = ?'); params.push(data.phone) }
+   649→    if (data.gstin !== undefined) { sets.push('gstin = ?'); params.push(data.gstin) }
+   650→    if (data.taxRate !== undefined) { sets.push('taxRate = ?'); params.push(data.taxRate) }
+   651→    if (data.currency) { sets.push('currency = ?'); params.push(data.currency) }
+   652→    if (data.active !== undefined) { sets.push('active = ?'); params.push(data.active ? 1 : 0) }
+   653→    if (!sets.length) return this.getById(id)
+   654→    params.push(id)
+   655→    execute(`UPDATE Shop SET ${sets.join(', ')}, updatedAt = datetime('now') WHERE id = ?`, params)
+   656→    const updated = this.getById(id)
+   657→    if (updated) trackUpsert('Shop', updated)
+   658→    return updated
+   659→  },
+   660→  delete(id: string) { execute('DELETE FROM Shop WHERE id = ?', [id]); trackDelete('Shop', id) },
+   661→}
+   662→
+   663→// ═══════════════════════════════════════
+   664→//  CUSTOMERS
+   665→// ═══════════════════════════════════════
+   666→export const customers = {
+   667→  list(shopId: string) { return query('SELECT * FROM Customer WHERE shopId = ? ORDER BY createdAt DESC', [shopId]) },
+   668→  create(shopId: string, data: any) {
+   669→    const id = genId()
+   670→    execute('INSERT INTO Customer (id, shopId, name, phone, email, address, notes) VALUES (?,?,?,?,?,?,?)',
+   671→      [id, shopId, data.name, data.phone || null, data.email || null, data.address || null, data.notes || null])
+   672→    const created = queryOne('SELECT * FROM Customer WHERE id = ?', [id])
+   673→    if (created) trackUpsert('Customer', created)
+   674→    return created
+   675→  },
+   676→  update(id: string, data: any) {
+   677→    execute(`UPDATE Customer SET name = ?, phone = ?, email = ?, address = ?, notes = ?, updatedAt = datetime('now') WHERE id = ?`,
+   678→      [data.name, data.phone || null, data.email || null, data.address || null, data.notes || null, id])
+   679→    const updated = queryOne('SELECT * FROM Customer WHERE id = ?', [id])
+   680→    if (updated) trackUpsert('Customer', updated)
+   681→  },
+   682→  delete(id: string) { execute('DELETE FROM Customer WHERE id = ?', [id]); trackDelete('Customer', id) },
+   683→}
+   684→
+   685→// ═══════════════════════════════════════
+   686→//  SUPPLIERS
+   687→// ═══════════════════════════════════════
+   688→export const suppliers = {
+   689→  list(shopId: string) { return query('SELECT * FROM Supplier WHERE shopId = ? ORDER BY createdAt DESC', [shopId]) },
+   690→  create(shopId: string, data: any) {
+   691→    const id = genId()
+   692→    execute('INSERT INTO Supplier (id, shopId, name, phone, email, address, notes) VALUES (?,?,?,?,?,?,?)',
+   693→      [id, shopId, data.name, data.phone || null, data.email || null, data.address || null, data.notes || null])
+   694→    const created = queryOne('SELECT * FROM Supplier WHERE id = ?', [id])
+   695→    if (created) trackUpsert('Supplier', created)
+   696→    return created
+   697→  },
+   698→  update(id: string, data: any) {
+   699→    execute(`UPDATE Supplier SET name = ?, phone = ?, email = ?, address = ?, notes = ?, updatedAt = datetime('now') WHERE id = ?`,
+   700→      [data.name, data.phone || null, data.email || null, data.address || null, data.notes || null, id])
+   701→    const updated = queryOne('SELECT * FROM Supplier WHERE id = ?', [id])
+   702→    if (updated) trackUpsert('Supplier', updated)
+   703→  },
+   704→  delete(id: string) { execute('DELETE FROM Supplier WHERE id = ?', [id]); trackDelete('Supplier', id) },
+   705→}
+   706→
+   707→// ═══════════════════════════════════════
+   708→//  PURCHASES (with stock bump)
+   709→// ═══════════════════════════════════════
+   710→export const purchases = {
+   711→  list(shopId: string) { return query('SELECT * FROM Purchase WHERE shopId = ? ORDER BY createdAt DESC', [shopId]) },
+   712→  create(shopId: string, data: any) {
+   713→    const id = genId()
+   714→    const items = JSON.stringify(data.items || [])
+   715→    const total = data.items?.reduce((s: number, it: any) => s + (it.total || 0), 0) || data.total || 0
+   716→    execute(`INSERT INTO Purchase (id, shopId, invoiceNumber, supplierId, supplierName, subtotal, taxAmount, total, paymentMode, notes, items)
+   717→      VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+   718→      [id, shopId, data.invoiceNumber || `INV-${Date.now()}`, data.supplierId || null, data.supplierName || null,
+   719→       data.subtotal || total, data.taxAmount || 0, total, data.paymentMode || 'cash', data.notes || null, items])
+   720→    for (const it of (data.items || [])) {
+   721→      if (it.menuItemId) {
+   722→        execute('UPDATE MenuItem SET stock = stock + ? WHERE id = ?', [Number(it.qty) || 0, it.menuItemId])
+   723→        const mi = menu.getById(it.menuItemId)
+   724→        if (mi) trackUpsert('MenuItem', mi)
+   725→      }
+   726→    }
+   727→    const created = queryOne('SELECT * FROM Purchase WHERE id = ?', [id])
+   728→    if (created) trackUpsert('Purchase', created)
+   729→    return created
+   730→  },
+   731→  delete(id: string) { execute('DELETE FROM Purchase WHERE id = ?', [id]); trackDelete('Purchase', id) },
+   732→}
+   733→
+   734→// ═══════════════════════════════════════
+   735→//  EXPENSES
+   736→// ═══════════════════════════════════════
+   737→export const expenses = {
+   738→  list(shopId: string) { return query('SELECT * FROM Expense WHERE shopId = ? ORDER BY date DESC', [shopId]) },
+   739→  create(shopId: string, data: any) {
+   740→    const id = genId()
+   741→    execute('INSERT INTO Expense (id, shopId, category, description, amount, paymentMode, date) VALUES (?,?,?,?,?,?,?)',
+   742→      [id, shopId, data.category, data.description, data.amount, data.paymentMode || 'cash', data.date || new Date().toISOString()])
+   743→    const created = queryOne('SELECT * FROM Expense WHERE id = ?', [id])
+   744→    if (created) trackUpsert('Expense', created)
+   745→    return created
+   746→  },
+   747→  delete(id: string) { execute('DELETE FROM Expense WHERE id = ?', [id]); trackDelete('Expense', id) },
+   748→}
+   749→
+   750→// ═══════════════════════════════════════
+   751→//  MONEY IN
+   752→// ═══════════════════════════════════════
+   753→export const moneyIn = {
+   754→  list(shopId: string) { return query('SELECT * FROM MoneyIn WHERE shopId = ? ORDER BY date DESC', [shopId]) },
+   755→  create(shopId: string, data: any) {
+   756→    const id = genId()
+   757→    execute('INSERT INTO MoneyIn (id, shopId, amount, source, description, partyName, paymentMode, date) VALUES (?,?,?,?,?,?,?,?)',
+   758→      [id, shopId, data.amount, data.source || data.category || 'Investment', data.description || null, data.partyName || null, data.paymentMode || 'cash', data.date || new Date().toISOString()])
+   759→    const created = queryOne('SELECT * FROM MoneyIn WHERE id = ?', [id])
+   760→    if (created) trackUpsert('MoneyIn', created)
+   761→    return created
+   762→  },
+   763→  delete(id: string) { execute('DELETE FROM MoneyIn WHERE id = ?', [id]); trackDelete('MoneyIn', id) },
+   764→}
+   765→
+   766→// ═══════════════════════════════════════
+   767→//  MONEY OUT
+   768→// ═══════════════════════════════════════
+   769→export const moneyOut = {
+   770→  list(shopId: string) { return query('SELECT * FROM MoneyOut WHERE shopId = ? ORDER BY date DESC', [shopId]) },
+   771→  create(shopId: string, data: any) {
+   772→    const id = genId()
+   773→    execute('INSERT INTO MoneyOut (id, shopId, amount, purpose, description, partyName, paymentMode, date) VALUES (?,?,?,?,?,?,?,?)',
+   774→      [id, shopId, data.amount, data.purpose || data.category || 'Owner Draw', data.description || null, data.partyName || null, data.paymentMode || 'cash', data.date || new Date().toISOString()])
+   775→    const created = queryOne('SELECT * FROM MoneyOut WHERE id = ?', [id])
+   776→    if (created) trackUpsert('MoneyOut', created)
+   777→    return created
+   778→  },
+   779→  delete(id: string) { execute('DELETE FROM MoneyOut WHERE id = ?', [id]); trackDelete('MoneyOut', id) },
+   780→}
+   781→
+   782→// ═══════════════════════════════════════
+   783→//  REPORTS
+   784→// ═══════════════════════════════════════
+   785→export const reports = {
+   786→  get(shopId: string, from?: string, to?: string) {
+   787→    const fromIso = from ? new Date(from).toISOString() : new Date(0).toISOString()
+   788→    const toIso = to ? new Date(to).toISOString() : new Date().toISOString()
+   789→    const bills = query<any>('SELECT * FROM Bill WHERE shopId = ? AND paidAt >= ? AND paidAt <= ? ORDER BY paidAt DESC', [shopId, fromIso, toIso])
+   790→    const expensesList = query<any>('SELECT * FROM Expense WHERE shopId = ? AND date >= ? AND date <= ?', [shopId, fromIso, toIso])
+   791→    const purchasesList = query<any>('SELECT * FROM Purchase WHERE shopId = ? AND createdAt >= ? AND createdAt <= ?', [shopId, fromIso, toIso])
+   792→    const salesRevenue = bills.reduce((s, b) => s + (b.total || 0), 0)
+   793→    const totalExpenses = expensesList.reduce((s, e) => s + (e.amount || 0), 0)
+   794→    const totalPurchases = purchasesList.reduce((s, p) => s + (p.total || 0), 0)
+   795→    const byPayment: Record<string, number> = {}
+   796→    for (const b of bills) byPayment[b.paymentMode] = (byPayment[b.paymentMode] || 0) + (b.total || 0)
+   797→    const topItemsMap: Record<string, { name: string; qty: number; revenue: number }> = {}
+   798→    for (const b of bills) {
+   799→      try {
+   800→        const items = JSON.parse(b.items || '[]')
+   801→        for (const it of items) {
+   802→          if (!topItemsMap[it.name]) topItemsMap[it.name] = { name: it.name, qty: 0, revenue: 0 }
+   803→          topItemsMap[it.name].qty += (it.quantity || 0)
+   804→          topItemsMap[it.name].revenue += (it.quantity || 0) * (it.price || 0)
+   805→        }
+   806→      } catch { /* ignore */ }
+   807→    }
+   808→    const topItems = Object.values(topItemsMap).sort((a, b) => b.qty - a.qty).slice(0, 10)
+   809→    const expenseByCategory: Record<string, number> = {}
+   810→    for (const e of expensesList) expenseByCategory[e.category] = (expenseByCategory[e.category] || 0) + (e.amount || 0)
+   811→    const dailyMap: Record<string, number> = {}
+   812→    for (const b of bills) {
+   813→      const day = (b.paidAt || '').slice(0, 10)
+   814→      if (day) dailyMap[day] = (dailyMap[day] || 0) + (b.total || 0)
+   815→    }
+   816→    const dailyBreakdown = Object.entries(dailyMap).map(([date, revenue]) => ({ date, revenue })).sort((a, b) => a.date.localeCompare(b.date))
+   817→    return {
+   818→      summary: {
+   819→        salesRevenue, totalExpenses, totalPurchases,
+   820→        netProfit: salesRevenue - totalExpenses - totalPurchases,
+   821→        cashFlow: salesRevenue - totalExpenses - totalPurchases,
+   822→        billCount: bills.length,
+   823→        avgBill: bills.length ? salesRevenue / bills.length : 0,
+   824→      },
+   825→      byPayment, topItems, expenseByCategory, dailyBreakdown, bills,
+   826→    }
+   827→  },
+   828→}
+   829→
+   830→// ═══════════════════════════════════════
+   831→//  CONVERTERS (SQLite integer → JS boolean/types)
+   832→// ═══════════════════════════════════════
+   833→function convertShop(row: any) {
+   834→  return { ...row, active: !!row.active }
+   835→}
+   836→function convertMenuItem(row: any) {
+   837→  return { ...row, available: !!row.available }
+   838→}
+   839→function convertTable(row: any) {
+   840→  return { ...row, status: row.status }
+   841→}
+   842→function convertOrder(row: any) {
+   843→  return { ...row, kotPrinted: !!row.kotPrinted, billPrinted: !!row.billPrinted }
+   844→}
+   845→function convertOrderItem(row: any) {
+   846→  return { ...row }
+   847→}
+   848→function convertBill(row: any) {
+   849→  return { ...row }
+   850→}
+   851→function convertSettings(row: any) {
+   852→  if (!row) return null
+   853→  const boolKeys = ['billShowLogo','billShowGstin','billShowPhone','billShowAddress','billShowEmail','billShowDateTime','billShowWaiter','billShowCustomer','billShowKotNo','kotShowLogo','kotShowWaiter','kotShowDateTime','kotShowTable','kotShowGuests','zomatoEnabled']
+   854→  const result = { ...row }
+   855→  for (const key of boolKeys) { if (key in result) result[key] = !!result[key] }
+   856→  return result
+   857→}
+   858→function convertUser(row: any) {
+   859→  return { ...row, active: !!row.active }
+   860→}
+   861→function convertZomatoOrder(row: any) {
+   862→  if (!row) return null
+   863→  return { ...row }
+   864→}
+   865→

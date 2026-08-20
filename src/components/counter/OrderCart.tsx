@@ -64,7 +64,7 @@ export function OrderCart({
       </div>
 
       {/* Items */}
-      <div className="flex-1 overflow-y-auto px-3 py-2">
+      <div className="flex-1 overflow-y-auto px-3 py-2 thin-scrollbar">
         {activeItems.length === 0 && (
           <div className="text-center py-10 text-sm text-slate-400">
             No items yet.<br />Tap menu items on the left to add them.

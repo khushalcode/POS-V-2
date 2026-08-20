@@ -75,7 +75,6 @@ export function BillingDialog({
       const bill = await onConfirm({ taxRate, discount, serviceCharge, paymentMode })
       setGeneratedBill(bill)
       setShowPrint(true)
-      onAfterBill?.(bill)
     } catch (e) {
       console.error(e)
     } finally {
@@ -224,18 +223,22 @@ export function BillingDialog({
         )}
       </AnimatePresence>
 
-      {/* Print preview after bill — 2 copies: Customer + Restaurant */}
+      {/* Print preview after bill — single copy (Customer Copy only) */}
+      {/* Table/order only gets closed out once the cashier is actually done
+          with the print preview (closes it or finishes printing) — not on a
+          timer, so the receipt never gets yanked away mid-print. */}
       <PrintPreview
         open={showPrint}
         onClose={() => {
+          const bill = generatedBill
           setShowPrint(false)
           onClose()
+          onAfterBill?.(bill)
         }}
         title={`Bill #${generatedBill?.billNo || billNo}`}
-        subtitle="2 copies will print"
+        subtitle="Customer copy"
         copies={[
           { label: 'Customer Copy', banner: '*** CUSTOMER COPY ***' },
-          { label: 'Restaurant Copy', banner: '*** RESTAURANT COPY ***' },
         ]}
       >
         {generatedBill && <BillReceipt bill={generatedBill} style={settings} />}

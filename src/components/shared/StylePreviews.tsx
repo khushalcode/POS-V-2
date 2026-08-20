@@ -40,14 +40,14 @@ export function BillReceiptPreview({ settings }: { settings: any }) {
         </div>
       )}
       <div className="border-t-2 my-1.5" style={{ borderTopColor: accent }} />
-      <div className="space-y-0.5">
+      <div className="space-y-0.5 text-slate-1000 font-bold">
         <Row label="Bill No:" value={`#${settings.invoicePrefix || 'INV'}-1001`} />
         {settings.billShowDateTime && <Row label="Date:" value="05 Jul 2026, 12:30 PM" />}
         {settings.billShowCustomer && <Row label="Customer:" value="Walk-in" />}
         {settings.billShowWaiter && <Row label="Waiter:" value="Riya" />}
         {settings.billShowKotNo && <Row label="KOT No:" value="#1" />}
       </div>
-      <div className="border-t border-dashed border-slate-300 my-1.5" />
+      <div className="border-t border-dashed text-slate-900 border-slate-300 my-1.5" />
       <table className="w-full">
         <thead>
           <tr style={{ borderBottom: `1px solid ${accent}` }}>
@@ -58,16 +58,16 @@ export function BillReceiptPreview({ settings }: { settings: any }) {
           </tr>
         </thead>
         <tbody>
-          <tr><td>Butter Chicken</td><td className="text-right">1</td><td className="text-right">320</td><td className="text-right font-bold">320</td></tr>
-          <tr><td>Butter Naan</td><td className="text-right">3</td><td className="text-right">50</td><td className="text-right font-bold">150</td></tr>
-          <tr><td>Masala Chai</td><td className="text-right">2</td><td className="text-right">40</td><td className="text-right font-bold">80</td></tr>
+          <tr><td>Butter Chicken</td><td className="text-right">1</td><td className="text-right">320</td><td className="text-right text-slate-900 font-bold">320</td></tr>
+          <tr><td>Butter Naan</td><td className="text-right">3</td><td className="text-right">50</td><td className="text-right text-slate-900 font-bold">150</td></tr>
+          <tr><td>Masala Chai</td><td className="text-right">2</td><td className="text-right">40</td><td className="text-right text-slate-900 font-bold">80</td></tr>
         </tbody>
       </table>
       <div className="border-t border-dashed border-slate-300 my-1.5" />
       <Row label="Subtotal" value="₹550.00" />
       <Row label={`Tax (${settings.taxRate || 5}%)`} value="₹27.50" />
       <div className="border-t-2 my-1" style={{ borderTopColor: accent }} />
-      <div className="flex justify-between font-bold text-sm">
+      <div className="flex justify-between text-slate-900 font-bold text-sm">
         <span>TOTAL</span>
         <span style={{ color: accent }}>₹577.50</span>
       </div>
@@ -76,7 +76,7 @@ export function BillReceiptPreview({ settings }: { settings: any }) {
           {settings.billExtraNote}
         </div>
       )}
-      <div className="text-center text-[10px] text-slate-500 mt-2">
+      <div className="text-center text-[10px] font-bold text-slate-900 mt-2">
         {settings.footerNote || 'Thank you for dining with us!'}
       </div>
     </div>

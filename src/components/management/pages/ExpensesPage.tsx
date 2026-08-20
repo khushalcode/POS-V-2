@@ -14,14 +14,18 @@ import { toast } from 'sonner'
 import { formatCurrency, formatDateTime } from '@/lib/format'
 import type { Expense } from '@/lib/types'
 import { useShopFetch } from '@/hooks/use-shop-fetch'
+import { useSession } from '@/lib/session'
+import { ReasonDialog, type PendingDelete } from './ReasonDialog'
 
 const CATEGORIES = ['Rent', 'Salary', 'Utilities', 'Maintenance', 'Marketing', 'Supplies', 'Transport', 'Misc']
 
 export default function ExpensesPage() {
   const shopFetch = useShopFetch()
+  const { user } = useSession()
   const [items, setItems] = useState<Expense[]>([])
   const [loading, setLoading] = useState(true)
   const [showAdd, setShowAdd] = useState(false)
+  const [pendingDel, setPendingDel] = useState<PendingDelete | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -56,10 +60,32 @@ export default function ExpensesPage() {
     load()
   }
 
-  const del = async (id: string) => {
+  const del = async (id: string, reason: string) => {
+    const item = items.find((e) => e.id === id)
+    try {
+      await shopFetch('/api/audit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'expense_deleted',
+          details: {
+            id,
+            amount: item?.amount,
+            category: item?.category,
+            description: item?.description,
+            date: item?.date,
+            reason,
+            deletedBy: user?.name || 'unknown',
+          },
+        }),
+      })
+    } catch (e) {
+      console.warn('[expenses] audit log failed:', e)
+    }
     const res = await shopFetch(`/api/expenses?id=${id}`, { method: 'DELETE' })
-    if (!res.ok) { toast.error('Failed to delete'); return }
+    if (!res.ok) { toast.error('Failed to delete'); throw new Error('delete failed') }
     toast.success('Expense deleted')
+    setPendingDel(null)
     load()
   }
 
@@ -126,7 +152,12 @@ export default function ExpensesPage() {
                       </td>
                       <td className="px-4 py-3 text-right font-bold text-rose-600">{formatCurrency(e.amount)}</td>
                       <td className="px-4 py-3 text-right">
-                        <Button size="sm" variant="ghost" className="text-rose-500" onClick={() => del(e.id)}>
+                        <Button size="sm" variant="ghost" className="text-rose-500" onClick={() =>
+                          setPendingDel({
+                            id: e.id,
+                            label: `${formatCurrency(e.amount)} · ${e.category}${e.description ? ' — ' + e.description : ''}`,
+                          })
+                        }>
                           <Trash2 className="w-3.5 h-3.5" />
                         </Button>
                       </td>
@@ -152,6 +183,14 @@ export default function ExpensesPage() {
           />
         </DialogContent>
       </Dialog>
+
+      {/* Delete reason dialog — always asks why before deleting */}
+      <ReasonDialog
+        pending={pendingDel}
+        onConfirm={del}
+        onCancel={() => setPendingDel(null)}
+        entityLabel="Expense Entry"
+      />
     </div>
   )
 }

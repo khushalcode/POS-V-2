@@ -79,9 +79,9 @@ export async function GET() {
     }
 
     // ─── Seed super admin ───
-    const existingUser = await db.appUser.findUnique({ where: { email: 'super@servingsync.com' } })
+    const existingUser = await db.appUser.findUnique({ where: { email: 'super@thuso.com' } })
     if (!existingUser) {
-      await db.appUser.create({ data: { name: 'Super Admin', email: 'super@servingsync.com', password: 'admin123', role: 'admin', shopId: null } })
+      await db.appUser.create({ data: { name: 'Super Admin', email: 'super@thuso.com', password: 'admin123', role: 'admin', shopId: null } })
     }
 
     // ─── Seed license keys ───

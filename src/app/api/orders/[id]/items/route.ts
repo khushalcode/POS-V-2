@@ -20,7 +20,7 @@ export async function POST(req: NextRequest, { params }: Ctx) {
     return NextResponse.json({ error: 'Cannot add items to a billed/paid order' }, { status: 400 })
   }
 
-  const createdItems: Awaited<ReturnType<typeof db.orderItem.create>>[] = []
+  const createdItems = []
   for (const it of items) {
     const menu = await db.menuItem.findUnique({ where: { id: it.menuItemId } })
     if (!menu) continue

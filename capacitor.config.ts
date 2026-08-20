@@ -1,8 +1,8 @@
 import { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
-  appId: 'com.servingsync.pos',
-  appName: 'ServingSync POS',
+  appId: 'com.thuso.pos',
+  appName: 'Thuso',
   webDir: 'out',
   plugins: {
     StatusBar: {

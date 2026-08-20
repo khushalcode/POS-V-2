@@ -11,15 +11,19 @@ import { toast } from 'sonner'
 import { formatCurrency, formatDateTime } from '@/lib/format'
 import type { MoneyIn } from '@/lib/types'
 import { EntryForm } from './ExpensesPage'
+import { ReasonDialog, type PendingDelete } from './ReasonDialog'
 import { useShopFetch } from '@/hooks/use-shop-fetch'
+import { useSession } from '@/lib/session'
 
 const SOURCES = ['Investment', 'Loan', 'Refund', 'Owner Contribution', 'Asset Sale', 'Misc']
 
 export default function MoneyInPage() {
   const shopFetch = useShopFetch()
+  const { user, currentShop } = useSession()
   const [items, setItems] = useState<MoneyIn[]>([])
   const [loading, setLoading] = useState(true)
   const [showAdd, setShowAdd] = useState(false)
+  const [pendingDel, setPendingDel] = useState<PendingDelete | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -60,10 +64,32 @@ export default function MoneyInPage() {
     load()
   }
 
-  const del = async (id: string) => {
+  const del = async (id: string, reason: string) => {
+    // Audit log the reason first (best-effort)
+    const item = items.find((i) => i.id === id)
+    try {
+      await shopFetch('/api/audit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'money_in_deleted',
+          details: {
+            id,
+            amount: item?.amount,
+            source: item?.source,
+            date: item?.date,
+            reason,
+            deletedBy: user?.name || 'unknown',
+          },
+        }),
+      })
+    } catch (e) {
+      console.warn('[moneyin] audit log failed:', e)
+    }
     const res = await shopFetch(`/api/moneyin?id=${id}`, { method: 'DELETE' })
-    if (!res.ok) { toast.error('Failed to delete'); return }
-    toast.success('Deleted')
+    if (!res.ok) { toast.error('Failed to delete'); throw new Error('delete failed') }
+    toast.success('Entry deleted')
+    setPendingDel(null)
     load()
   }
 
@@ -143,7 +169,12 @@ export default function MoneyInPage() {
                       </td>
                       <td className="px-4 py-3 text-right font-bold text-emerald-600">{formatCurrency(m.amount)}</td>
                       <td className="px-4 py-3 text-right">
-                        <Button size="sm" variant="ghost" className="text-rose-500" onClick={() => del(m.id)}>
+                        <Button size="sm" variant="ghost" className="text-rose-500" onClick={() =>
+                          setPendingDel({
+                            id: m.id,
+                            label: `${formatCurrency(m.amount)} · ${m.source}${m.description ? ' — ' + m.description : ''}`,
+                          })
+                        }>
                           <Trash2 className="w-3.5 h-3.5" />
                         </Button>
                       </td>
@@ -169,6 +200,14 @@ export default function MoneyInPage() {
           />
         </DialogContent>
       </Dialog>
+
+      {/* Delete reason dialog — always asks why before deleting */}
+      <ReasonDialog
+        pending={pendingDel}
+        onConfirm={del}
+        onCancel={() => setPendingDel(null)}
+        entityLabel="Money In Entry"
+      />
     </div>
   )
 }

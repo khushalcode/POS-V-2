@@ -69,11 +69,39 @@ export function PrintPreview({ open, onClose, title, subtitle, children, width =
 
     if (!copiesHtml) return
 
-    const win = window.open('', '_blank', 'width=400,height=600')
-    if (!win) return
-    win.document.write(`
+    // ─── Hidden-iframe printing ────────────────────────────────────────
+    // We deliberately do NOT use `window.open('', '_blank', …)` here.
+    // The Electron main process denies all `window.open` popups via
+    // `setWindowOpenHandler` (see electron/main.js), which silently broke
+    // the Print button in the packaged .exe build — `win` came back null
+    // and the function returned early without ever showing a print dialog.
+    //
+    // A hidden iframe works in Electron, regular browsers, and PWAs:
+    //   • no popup blocker
+    //   • no setWindowOpenHandler interception
+    //   • `iframe.contentWindow.print()` opens the same OS print dialog
+    const iframe = document.createElement('iframe')
+    iframe.setAttribute('aria-hidden', 'true')
+    iframe.style.position = 'fixed'
+    iframe.style.right = '0'
+    iframe.style.bottom = '0'
+    iframe.style.width = '0'
+    iframe.style.height = '0'
+    iframe.style.border = '0'
+    iframe.style.opacity = '0'
+    document.body.appendChild(iframe)
+
+    const doc = iframe.contentWindow?.document
+    if (!doc) {
+      if (iframe.parentNode) iframe.parentNode.removeChild(iframe)
+      return
+    }
+
+    doc.open()
+    doc.write(`
       <html>
         <head>
+          <meta charset="utf-8" />
           <title>${title}</title>
           <style>
             * { box-sizing: border-box; }
@@ -92,6 +120,11 @@ export function PrintPreview({ open, onClose, title, subtitle, children, width =
             table { width: 100%; border-collapse: collapse; font-size: 11px; }
             th, td { text-align: left; padding: 2px 0; }
             th { border-bottom: 1px solid #000; }
+            /* When the receipt has class "bold-all", every text element
+               inherits font-weight: bold. This is controlled by the
+               billBoldFont / kotBoldFont setting in ShopSetting. */
+            .bold-all, .bold-all * { font-weight: bold !important; }
+            .bold-all .xs, .bold-all .sm { font-weight: bold !important; }
             @media print {
               @page { margin: 4mm; }
               body { padding: 0; }
@@ -101,12 +134,65 @@ export function PrintPreview({ open, onClose, title, subtitle, children, width =
         <body><div class="receipt">${copiesHtml}</div></body>
       </html>
     `)
-    win.document.close()
-    win.focus()
-    setTimeout(() => {
-      win.print()
-      win.close()
-    }, 250)
+    doc.close()
+
+    // Trigger the print, then remove the iframe.
+    // `afterprint` fires in most browsers once the print dialog is closed
+    // (success or cancel); we also keep a safety timeout so the iframe is
+    // always cleaned up even if `afterprint` doesn't fire (e.g. older Edge).
+    const cleanup = () => {
+      if (iframe.parentNode) iframe.parentNode.removeChild(iframe)
+    }
+
+    const doPrint = () => {
+      try {
+        const w = iframe.contentWindow
+        if (!w) {
+          cleanup()
+          return
+        }
+        w.focus()
+        // `afterprint` is the most reliable "print done" signal across
+        // Chromium (Electron), Chrome, and Firefox.
+        const afterOnce = () => {
+          w.removeEventListener('afterprint', afterOnce)
+          cleanup()
+        }
+        w.addEventListener('afterprint', afterOnce)
+        w.print()
+        // Safety net: if `afterprint` never fires (some mobile WebViews),
+        // clean up after a short delay so we don't leak iframes.
+        setTimeout(cleanup, 2000)
+      } catch (err) {
+        console.error('[PrintPreview] print failed:', err)
+        cleanup()
+      }
+    }
+
+    // Give the iframe a tick to lay out before calling print. For receipts
+    // containing images we wait for them, otherwise a small fixed delay is
+    // enough for fonts/layout to settle.
+    const imgs = Array.from(doc.images || [])
+    if (imgs.length === 0) {
+      setTimeout(doPrint, 100)
+    } else {
+      let loaded = 0
+      const onImgDone = () => {
+        loaded++
+        if (loaded >= imgs.length) doPrint()
+      }
+      imgs.forEach((img) => {
+        if (img.complete) onImgDone()
+        else {
+          img.addEventListener('load', onImgDone, { once: true })
+          img.addEventListener('error', onImgDone, { once: true })
+        }
+      })
+      // Hard timeout in case an image hangs — we still want to print.
+      setTimeout(() => {
+        if (loaded < imgs.length) doPrint()
+      }, 2500)
+    }
   }
 
   if (typeof window === 'undefined') return null

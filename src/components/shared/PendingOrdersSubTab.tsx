@@ -10,12 +10,7 @@ import { formatCurrency, timeAgo, ORDER_STATUS_LABELS, ORDER_STATUS_COLORS } fro
 import type { Order } from '@/lib/types'
 
 interface PendingOrdersSubTabProps {
-  shopFetch: (url: string, options?: RequestInit) => Promise<{
-    ok: boolean
-    status: number
-    json: () => Promise<any>
-    text: () => Promise<string>
-  }>
+  shopFetch: (url: string, options?: RequestInit) => Promise<any>
   onPickOrder: (orderId: string) => void
   /** Title shown above the pending list (defaults to "Pending in Kitchen") */
   title?: string

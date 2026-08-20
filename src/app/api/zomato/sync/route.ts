@@ -47,7 +47,7 @@ export async function POST(req: NextRequest) {
       // Zomato API returns orders in various formats depending on API version.
       // We normalize them into our ZomatoOrder format.
       const rawOrders = data.orders || data.data || data || []
-      const created: Awaited<ReturnType<typeof db.zomatoOrder.create>>[] = []
+      const created = []
 
       for (const raw of rawOrders) {
         const zomatoOrderId = raw.order_id || raw.id || raw.orderId
@@ -120,7 +120,7 @@ export async function POST(req: NextRequest) {
     { customer: 'Ananya Iyer', phone: '98765 43210', items: [['Veg Biryani', 1, 240], ['Gulab Jamun', 2, 80], ['Masala Chai', 1, 40]], type: 'delivery', address: '78 Anna Salai, Chennai', payment: 'prepaid' },
   ]
 
-  const created: Awaited<ReturnType<typeof db.zomatoOrder.create>>[] = []
+  const created = []
   for (const s of samples) {
     if (Math.random() < 0.5) continue
 
