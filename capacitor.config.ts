@@ -1,14 +1,9 @@
-import { CapacitorConfig } from '@capacitor/cli';
+import type { CapacitorConfig } from '@capacitor/cli';
 
 const config: CapacitorConfig = {
-  appId: 'com.thuso.pos',
+  appId: 'com.thuso.app',
   appName: 'Thuso',
-  webDir: 'out',
-  plugins: {
-    StatusBar: {
-      overlaysWebView: false,
-    },
-  },
+  webDir: 'public'
 };
 
 export default config;
